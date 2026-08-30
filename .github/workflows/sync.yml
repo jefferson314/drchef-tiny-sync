@@ -19,7 +19,7 @@ jobs:
           node-version: '20'
 
       - name: Instalar dependências
-        run: npm ci
+        run: npm install
 
       - name: Cache do navegador do Playwright
         id: cache-playwright
