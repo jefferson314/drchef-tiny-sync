@@ -1,0 +1,48 @@
+name: Sincronizar OPs do Tiny com o Dr Chef Produção
+
+on:
+  schedule:
+    # A cada 20 minutos (dentro da faixa de 15-30 min pedida).
+    # Horário em UTC — GitHub Actions não converte para horário de Brasília.
+    - cron: '*/20 * * * *'
+  workflow_dispatch: {} # permite rodar manualmente pela aba "Actions" do GitHub
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+
+      - name: Instalar dependências
+        run: npm ci
+
+      - name: Cache do navegador do Playwright
+        id: cache-playwright
+        uses: actions/cache@v4
+        with:
+          path: ~/.cache/ms-playwright
+          key: playwright-${{ runner.os }}-${{ hashFiles('package-lock.json') }}
+
+      - name: Instalar navegador do Playwright (com dependências do sistema)
+        run: npx playwright install --with-deps chromium
+        if: steps.cache-playwright.outputs.cache-hit != 'true'
+
+      - name: Instalar só as dependências de sistema (quando o navegador já está em cache)
+        run: npx playwright install-deps chromium
+        if: steps.cache-playwright.outputs.cache-hit == 'true'
+
+      - name: Rodar sincronização
+        env:
+          TINY_SESSION_B64: ${{ secrets.TINY_SESSION_B64 }}
+          FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          # Só cria no Dr Chef as OPs criadas no Tiny a partir desta data
+          # (formato AAAA-MM-DD). OPs mais antigas são ignoradas, mesmo que
+          # ainda estejam "em aberto" no Tiny. Pode editar esse valor direto
+          # aqui quando quiser mudar o corte.
+          DATA_CORTE: '2026-08-01'
+        run: npm run sync
