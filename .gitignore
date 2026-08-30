@@ -1,0 +1,4 @@
+node_modules/
+tiny-session.json
+.tiny-session-runtime.json
+*.log
