@@ -139,7 +139,7 @@ async function buscarTecido(page, idInternoTiny) {
 
 // ---------------------------------------------------------------------------
 // 2) Converte um registro do Tiny para o formato do Dr Chef Produção
-// ---------------------------------------------------------------------------
+// --------------------------------------------------------------------------
 function tinyParaDrChef(opTiny) {
   // skuDescricao vem como "SKU - MODELO - COR - TAMANHO" (o SKU vem colado
   // com a descrição, separado por " - "). Ex:
@@ -173,7 +173,7 @@ function tinyParaDrChef(opTiny) {
     priority: 'normal',
     obs: `Importado automaticamente do Tiny (OP ${opTiny.numero}).`,
     localizacao: '',
-    tipoCliente: 'drchef',
+     tipoCliente: 'drchef',
     clienteB2bId: '',
     numeroPedido: '',
     obsCliente: '',
@@ -275,7 +275,9 @@ function calcularDataDeCorte() {
   let criadas = 0;
   for (const opTiny of novasOps) {
     const form = tinyParaDrChef(opTiny);
-    const now = Date.now();
+    // ISO string (não epoch numérico) para bater com o formato que o próprio
+    // app do Dr Chef usa em createdAt/updatedAt/history[].at em todo lugar.
+    const now = new Date().toISOString();
     const novoDoc = {
       id: genId(),
       ...form,
