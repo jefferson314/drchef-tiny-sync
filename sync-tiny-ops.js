@@ -12,14 +12,20 @@
  * - Não decide sozinho quantidade de peças cortadas nem nada operacional —
  *   isso continua sendo preenchido à mão no Dr Chef, como sempre foi.
  *
- * Para cada OP nova, além dos dados básicos (ref/modelo/cor/tamanho/qtd),
- * o script também busca:
- * - nomeProduto: a descrição completa do produto, tal como aparece no Tiny.
+ * Para cada OP nova, além dos dados básicos (ref/cor/tamanho/qtd), o script
+ * também busca/calcula:
+ * - modelo: só "MODELO <número>" (ex: "MODELO 90"), extraído da descrição.
+ * - nomeProduto: palavra-chave do produto + gênero (ex: "DÓLMÃ FEMININO"),
+ *   também extraído da descrição.
+ * - qty: sempre número inteiro, sem vírgula (ex: "6,00" vira "6").
  * - fabric (tecido): lido na tela de edição da própria OP no Tiny, seção
  *   "Composição" — pega a primeira linha cujo nome começa com "TECIDO"
  *   (ex: "TECIDO OXFORD ( BNY ) - BRANCO" vira fabric = "OXFORD ( BNY ) - BRANCO").
- *   Isso exige abrir a tela de cada OP nova individualmente (só as novas,
- *   não todas as 56 em aberto), então o script demora um pouco mais quando
+ * - ean: o GTIN/EAN da variação exata (cor+tamanho) do produto, lido em
+ *   Cadastros > Produtos > Variações (cada variação tem um EAN próprio,
+ *   diferente do EAN do produto "pai").
+ *   Isso exige abrir telas de cada OP nova individualmente (só as novas,
+ *   não todas as em aberto), então o script demora um pouco mais quando
  *   há OPs novas para criar.
  *
  * CONFIGURAÇÃO (variáveis de ambiente / GitHub Secrets — veja README.md):
@@ -36,6 +42,7 @@ const fs = require('fs');
 const path = require('path');
 
 const TINY_LIST_URL = 'https://erp.olist.com/ordens_producao';
+const PRODUCTS_LIST_URL = 'https://erp.olist.com/produtos';
 
 function log(...args) {
   console.log(new Date().toISOString(), '-', ...args);
@@ -138,8 +145,134 @@ async function buscarTecido(page, idInternoTiny) {
 }
 
 // ---------------------------------------------------------------------------
+// 1c) Busca o EAN/GTIN de uma variação específica (ref = código do SKU da
+//     variação, ex: "5133M") em Cadastros > Produtos > Variações. Cada
+//     variação (cor + tamanho) tem seu próprio EAN, diferente do EAN do
+//     produto "pai". Para produtos sem variação, o próprio Código (SKU) já
+//     é o ref e o EAN vem direto da listagem de produtos.
+// ---------------------------------------------------------------------------
+async function buscarEAN(page, ref) {
+  if (!ref) return '';
+  try {
+    await page.goto(PRODUCTS_LIST_URL, { waitUntil: 'networkidle' });
+
+    // Garante que nenhum filtro de uma busca anterior (ex: "variações") está
+    // escondendo o produto que queremos.
+    const limparFiltros = await page.$('a:has-text("limpar filtros")');
+    if (limparFiltros) {
+      await limparFiltros.click();
+      await page.waitForLoadState('networkidle');
+    }
+
+    await page.fill('#pesquisa-mini', ref);
+    await page.keyboard.press('Enter');
+    await page.waitForLoadState('networkidle');
+
+    const semResultado = await page.locator('text=Sua pesquisa não retornou resultados').count();
+    if (semResultado > 0) return '';
+
+    await page.waitForSelector('#tabelaListagem tbody tr', { timeout: 15000 });
+    const linhas = page.locator('#tabelaListagem tbody tr');
+    const totalLinhas = await linhas.count();
+
+    for (let i = 0; i < totalLinhas; i++) {
+      const linha = linhas.nth(i);
+      // Coluna "Código (SKU)" do produto "pai" (índice 4 na listagem).
+      const codigoBase = (await linha.locator('td').nth(4).innerText()).trim();
+
+      if (codigoBase === ref) {
+        // Produto simples (sem variações): a célula seguinte já é o EAN.
+        return (await linha.locator('td').nth(5).innerText()).trim();
+      }
+
+      const linkVariacoes = linha.locator('a.link', { hasText: 'variaç' });
+      if (await linkVariacoes.count() === 0) continue;
+
+      await linkVariacoes.first().click();
+      await page.waitForSelector('#tabela_variacoes tbody tr', { timeout: 15000 });
+      const linhasVar = page.locator('#tabela_variacoes tbody tr');
+      const totalVar = await linhasVar.count();
+      let eanEncontrado = '';
+      for (let j = 0; j < totalVar; j++) {
+        // Colunas da tabela de variações: [0] thumb, [1] Variação,
+        // [2] Código (SKU), [3] GTIN/EAN, ...
+        const sku = (await linhasVar.nth(j).locator('td').nth(2).innerText()).trim();
+        if (sku === ref) {
+          eanEncontrado = (await linhasVar.nth(j).locator('td').nth(3).innerText()).trim();
+          break;
+        }
+      }
+      const fechar = page.locator('text=fechar').first();
+      if (await fechar.count()) await fechar.click().catch(() => {});
+      if (eanEncontrado) return eanEncontrado;
+    }
+
+    return '';
+  } catch (err) {
+    log(`Aviso: não consegui buscar o EAN do produto "${ref}": ${err.message}`);
+    return '';
+  }
+}
+
+// ---------------------------------------------------------------------------
 // 2) Converte um registro do Tiny para o formato do Dr Chef Produção
-// --------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+
+// Palavras de gênero reconhecidas na descrição do produto
+// (ex: "... MODELO 90 FEMININO ...").
+const GENEROS = ['FEMININO', 'MASCULINO', 'UNISSEX', 'INFANTIL'];
+
+// A partir do trecho de descrição entre o SKU e a cor/tamanho (ex:
+// "DÓLMÃ MODELO 90 FEMININO OXFORD BRANCO"), extrai:
+// - modelo: só "MODELO <número>" (ex: "MODELO 90")
+// - nomeProduto: a palavra-chave do produto + gênero (ex: "DÓLMÃ FEMININO")
+// Se não achar o padrão "MODELO <número>" na descrição, mantém o texto
+// completo em ambos os campos (comportamento antigo), pra não perder
+// informação em produtos fora do padrão — o time ajusta na tela como sempre.
+function extrairModeloENome(descricaoModelo) {
+  const textoOriginal = (descricaoModelo || '').trim();
+  const matchModelo = textoOriginal.match(/MODELO\s*\d+/i);
+
+  const generoRegex = new RegExp(`\\b(${GENEROS.join('|')})\\b`, 'i');
+  const matchGenero = textoOriginal.match(generoRegex);
+  const genero = matchGenero ? matchGenero[0].toUpperCase() : '';
+
+  if (!matchModelo) {
+    return { modelo: textoOriginal, nomeProduto: textoOriginal };
+  }
+
+  const modelo = matchModelo[0].toUpperCase().replace(/\s+/g, ' ');
+
+  // Palavra-chave do produto = tudo antes de "MODELO", tirando o gênero caso
+  // ele apareça antes do "MODELO" também (ex: "TOUCA UNISSEX MODELO 65...").
+  let palavraChave = textoOriginal.slice(0, matchModelo.index);
+  if (genero) {
+    palavraChave = palavraChave.replace(new RegExp(`\\b${genero}\\b`, 'i'), '');
+  }
+  palavraChave = palavraChave.replace(/\s+/g, ' ').trim();
+
+  const nomeProduto = genero ? `${palavraChave} ${genero}`.trim() : palavraChave;
+
+  return { modelo, nomeProduto };
+}
+
+// A quantidade sempre vira número inteiro, sem vírgula — o Dr Chef só usa
+// peças inteiras (ex: "6,00" vira "6", "10,50" vira "11" arredondado).
+function formatarQuantidadeInteira(bruta) {
+  if (bruta === null || bruta === undefined || bruta === '') return '';
+  let texto = String(bruta).trim();
+  if (texto.includes(',') && texto.includes('.')) {
+    // formato brasileiro "1.234,50": ponto é separador de milhar, vírgula é decimal.
+    texto = texto.replace(/\./g, '').replace(',', '.');
+  } else if (texto.includes(',')) {
+    // só vírgula: assume separador decimal ("6,00" -> "6.00").
+    texto = texto.replace(',', '.');
+  }
+  const numero = parseFloat(texto);
+  if (isNaN(numero)) return String(bruta).trim();
+  return String(Math.round(numero));
+}
+
 function tinyParaDrChef(opTiny) {
   // skuDescricao vem como "SKU - MODELO - COR - TAMANHO" (o SKU vem colado
   // com a descrição, separado por " - "). Ex:
@@ -154,7 +287,8 @@ function tinyParaDrChef(opTiny) {
   // campos na tela do Dr Chef como já faz hoje, sem problema.
   const tamanho = resto.length >= 1 ? resto[resto.length - 1] : '';
   const cor = resto.length >= 2 ? resto[resto.length - 2] : '';
-  const modelo = resto.length >= 3 ? resto.slice(0, -2).join(' - ') : (resto[0] || '');
+  const descricaoModelo = resto.length >= 3 ? resto.slice(0, -2).join(' - ') : (resto[0] || '');
+  const { modelo, nomeProduto } = extrairModeloENome(descricaoModelo);
 
   const deadlineDate = opTiny.dataPrevistaTs
     ? new Date(Number(opTiny.dataPrevistaTs) * 1000).toISOString().slice(0, 10)
@@ -164,8 +298,9 @@ function tinyParaDrChef(opTiny) {
     op: opTiny.numero,
     ref,
     modelo: modelo || ref,
-    nomeProduto: opTiny.skuDescricao || '',
-    qty: opTiny.quantidade || '',
+    nomeProduto: nomeProduto || opTiny.skuDescricao || '',
+    ean: opTiny.ean || '',
+    qty: formatarQuantidadeInteira(opTiny.quantidade),
     size: tamanho,
     fabric: opTiny.fabric || '',
     color: cor,
@@ -173,7 +308,7 @@ function tinyParaDrChef(opTiny) {
     priority: 'normal',
     obs: `Importado automaticamente do Tiny (OP ${opTiny.numero}).`,
     localizacao: '',
-     tipoCliente: 'drchef',
+    tipoCliente: 'drchef',
     clienteB2bId: '',
     numeroPedido: '',
     obsCliente: '',
@@ -259,13 +394,21 @@ function calcularDataDeCorte() {
   const novasOps = opsTiny.filter(op => op.numero && !opsJaExistentes.has(String(op.numero)));
   log(`OPs novas a criar: ${novasOps.length}`);
 
-  // --- Para cada OP nova, busca o tecido na tela de edição (Composição) ---
+  // --- Para cada OP nova, busca o tecido e o EAN nas telas do Tiny ---
   for (const opTiny of novasOps) {
     opTiny.fabric = await buscarTecido(page, opTiny.idInternoTiny);
     if (opTiny.fabric) {
       log(`OP ${opTiny.numero}: tecido = "${opTiny.fabric}"`);
     } else {
       log(`OP ${opTiny.numero}: tecido não encontrado na Composição.`);
+    }
+
+    const ref = (opTiny.skuDescricao.split(' - ')[0] || '').trim();
+    opTiny.ean = await buscarEAN(page, ref);
+    if (opTiny.ean) {
+      log(`OP ${opTiny.numero}: EAN = "${opTiny.ean}"`);
+    } else {
+      log(`OP ${opTiny.numero}: EAN não encontrado para o SKU "${ref}".`);
     }
   }
 
