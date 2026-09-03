@@ -40,6 +40,11 @@ jobs:
         env:
           TINY_SESSION_B64: ${{ secrets.TINY_SESSION_B64 }}
           FIREBASE_SERVICE_ACCOUNT: ${{ secrets.FIREBASE_SERVICE_ACCOUNT }}
+          # Usados só quando a sessão salva (TINY_SESSION_B64) está perto de
+          # expirar ou já expirou — o script faz login automático sozinho
+          # nessa hora (ver "RENOVAÇÃO AUTOMÁTICA DE SESSÃO" em sync-tiny-ops.js).
+          TINY_USERNAME: ${{ secrets.TINY_USERNAME }}
+          TINY_SENHA: ${{ secrets.TINY_SENHA }}
           # Só cria no Dr Chef as OPs criadas no Tiny a partir desta data
           # (formato AAAA-MM-DD). OPs mais antigas são ignoradas, mesmo que
           # ainda estejam "em aberto" no Tiny. Pode editar esse valor direto
