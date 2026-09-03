@@ -1,0 +1,54 @@
+name: Teste isolado - login automático no Tiny
+
+# Só roda manualmente. NÃO tem agendamento (cron) — é só para o teste
+# pontual de viabilidade do login automatizado via Playwright, separado
+# da automação de produção (sync.yml).
+on:
+  workflow_dispatch: {}
+
+jobs:
+  test-login:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Configurar Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+
+      - name: Instalar dependências
+        run: npm install
+
+      - name: Cache do navegador do Playwright
+        uses: actions/cache@v4
+        id: playwright-cache
+        with:
+          path: ~/.cache/ms-playwright
+          key: ${{ runner.os }}-playwright-${{ hashFiles('package-lock.json') }}
+
+      - name: Instalar navegador do Playwright (com dependências de sistema)
+        if: steps.playwright-cache.outputs.cache-hit != 'true'
+        run: npx playwright install --with-deps chromium
+
+      - name: Instalar só as dependências de sistema (quando o navegador já está em cache)
+        if: steps.playwright-cache.outputs.cache-hit == 'true'
+        run: npx playwright install-deps chromium
+
+      - name: Rodar teste isolado de login
+        id: teste
+        env:
+          TINY_USERNAME: ${{ secrets.TINY_USERNAME }}
+          TINY_SENHA: ${{ secrets.TINY_SENHA }}
+        run: node test-tiny-login.js
+
+      - name: Subir screenshot como artifact (somente se o login não deu LOGIN_OK)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: test-login-screenshot
+          path: test-login-screenshot.png
+          if-no-files-found: ignore
+          retention-days: 7
