@@ -35,6 +35,46 @@
  *                             base64 (Firebase Console > Configurações do
  *                             projeto > Contas de serviço > Gerar nova
  *                             chave privada)
+ *   - TINY_USERNAME           usuário/e-mail de login do Tiny (só é usado
+ *                             se for preciso renovar a sessão sozinho —
+ *                             ver "RENOVAÇÃO AUTOMÁTICA DE SESSÃO" abaixo)
+ *   - TINY_SENHA              senha de login do Tiny (idem)
+ *
+ * RENOVAÇÃO AUTOMÁTICA DE SESSÃO
+ * ---------------------------------------------------------------------------
+ * O cookie de sessão do Tiny (KEYCLOAK_SESSION) expira ~24h após o login,
+ * então o TINY_SESSION_B64 salvo manualmente fica velho com o tempo. Para
+ * não depender de alguém renovar isso à mão todo dia, o script agora faz
+ * login sozinho (via Playwright, com TINY_USERNAME/TINY_SENHA) quando
+ * necessário, em duas situações:
+ *
+ *   1) PROATIVA: antes mesmo de tentar usar a sessão salva, o script olha a
+ *      validade do cookie KEYCLOAK_SESSION dentro do TINY_SESSION_B64. Se
+ *      faltar menos de RENEW_THRESHOLD_MINUTOS (padrão 90min) para expirar
+ *      (ou já tiver expirado), ele já faz login automático direto, sem nem
+ *      tentar a sessão velha.
+ *   2) REATIVA: se, por qualquer motivo, a sessão salva se mostrar inválida
+ *      na hora de usar (fomos redirecionados pro login), o script tenta o
+ *      login automático nesse momento, como um segundo mecanismo de segurança.
+ *
+ * Este login automático é o MESMO fluxo testado isoladamente em
+ * test-tiny-login.js (não muda, não tenta contornar nada): abre a tela de
+ * login normal, preenche usuário/senha, envia, e verifica objetivamente o
+ * resultado. Ele NUNCA tenta contornar Cloudflare, CAPTCHA ou verificação
+ * adicional (2FA/código) — se detectar qualquer um desses cenários, ou se o
+ * login vier com credenciais inválidas, a sincronização É INTERROMPIDA
+ * (process.exit(1)) com um alerta bem visível: uma anotação de erro do
+ * GitHub Actions (aparece em destaque na página do run) e um resumo no
+ * GITHUB_STEP_SUMMARY explicando que é preciso renovar manualmente. Ou seja,
+ * nunca falha em silêncio — ou sincroniza normalmente, ou para com um aviso
+ * claro pedindo ação manual.
+ *
+ * A sessão renovada automaticamente NÃO é salva de volta no secret
+ * TINY_SESSION_B64 (fica só na memória daquela execução) — então, depois
+ * que a sessão manual expira de vez, o robô passa a logar sozinho a cada
+ * execução (list custa uns 10s a mais por rodada, sem problema nenhum pra
+ * uma rotina que roda a cada 20min). Isso é intencional: evita a
+ * complexidade/risco de o workflow reescrever secrets do repositório sozinho.
  */
 const { chromium } = require('playwright');
 const admin = require('firebase-admin');
@@ -55,6 +95,244 @@ function precisaVar(nome) {
     process.exit(1);
   }
   return v;
+}
+
+// ---------------------------------------------------------------------------
+// 0) Renovação automática de sessão (login via Playwright quando necessário)
+//    — mesma lógica já validada isoladamente em test-tiny-login.js.
+// ---------------------------------------------------------------------------
+const RENEW_THRESHOLD_MINUTOS = Number(process.env.RENEW_THRESHOLD_MINUTOS || 90);
+
+const LOGIN_STATUS = {
+  LOGIN_OK: 'LOGIN_OK',
+  CLOUDFLARE_CHALLENGE: 'CLOUDFLARE_CHALLENGE',
+  CREDENCIAIS_INVALIDAS: 'CREDENCIAIS_INVALIDAS',
+  VERIFICACAO_ADICIONAL: 'VERIFICACAO_ADICIONAL',
+  LOGIN_INDETERMINADO: 'LOGIN_INDETERMINADO',
+};
+
+// Escreve um alerta BEM visível: uma anotação de erro do GitHub Actions
+// (aparece em destaque na página do run) + um resumo no GITHUB_STEP_SUMMARY
+// (aparece no topo da página do run). Objetivo: nunca falhar em silêncio.
+function alertarFalhaCritica(mensagemPrincipal, linhasDetalhe) {
+  console.error(`::error::${mensagemPrincipal}`);
+  log(`ERRO CRÍTICO: ${mensagemPrincipal}`);
+  for (const l of linhasDetalhe) log(`  - ${l}`);
+
+  const resumoMd = [
+    '## ❌ Sincronização Tiny → Dr Chef FALHOU — ação manual necessária',
+    '',
+    `**${mensagemPrincipal}**`,
+    '',
+    ...linhasDetalhe.map(l => `- ${l}`),
+    '',
+    'O que fazer: confira o login manualmente em https://erp.olist.com. Se a sessão salva é que expirou e o login automático não deu conta sozinho, rode `node setup-tiny-session.js` de novo e atualize o secret `TINY_SESSION_B64`.',
+  ].join('\n');
+
+  if (process.env.GITHUB_STEP_SUMMARY) {
+    try { fs.appendFileSync(process.env.GITHUB_STEP_SUMMARY, resumoMd + '\n'); } catch (_) { /* nunca deixa o alerta quebrar o script */ }
+  }
+}
+
+// Verifica, sem usar a sessão (só olhando o storageState salvo), se o cookie
+// KEYCLOAK_SESSION está perto de expirar. Se não conseguir ler/entender o
+// cookie por qualquer motivo, devolve "não precisa renovar" — o mecanismo
+// reativo (abaixo) continua sendo a rede de segurança garantida.
+function sessaoProximaDoVencimento(storageStatePath, limiteMinutos) {
+  try {
+    const dados = JSON.parse(fs.readFileSync(storageStatePath, 'utf8'));
+    const cookie = (dados.cookies || []).find(c => c.name === 'KEYCLOAK_SESSION' && /tiny\.com\.br$/i.test(c.domain || ''));
+    if (!cookie || !cookie.expires || cookie.expires <= 0) {
+      return { precisaRenovar: false, motivo: 'cookie KEYCLOAK_SESSION não encontrado ou sem validade definida' };
+    }
+    const minutosRestantes = (cookie.expires * 1000 - Date.now()) / 60000;
+    if (minutosRestantes < limiteMinutos) {
+      return { precisaRenovar: true, minutosRestantes, motivo: `faltam ${minutosRestantes.toFixed(0)}min para o cookie de sessão expirar (limite: ${limiteMinutos}min)` };
+    }
+    return { precisaRenovar: false, minutosRestantes, motivo: `sessão ainda válida por ~${minutosRestantes.toFixed(0)}min` };
+  } catch (err) {
+    return { precisaRenovar: false, motivo: `não consegui checar a validade da sessão salva (${err.message})` };
+  }
+}
+
+// --- Helpers de login automático (idênticos, em espírito, ao test-tiny-login.js) ---
+
+async function detectarCloudflareChallenge(page) {
+  const titulo = (await page.title().catch(() => '')) || '';
+  const tituloLower = titulo.toLowerCase();
+  const sinaisTitulo = ['just a moment', 'attention required', 'checking your browser', 'cloudflare'];
+  if (sinaisTitulo.some(s => tituloLower.includes(s))) return true;
+
+  const temIframeChallenge = await page.evaluate(() => {
+    const iframes = Array.from(document.querySelectorAll('iframe'));
+    return iframes.some(f => {
+      const src = (f.src || '').toLowerCase();
+      return src.includes('challenges.cloudflare.com') || src.includes('turnstile');
+    });
+  }).catch(() => false);
+  if (temIframeChallenge) return true;
+
+  const temTextoChallenge = await page.evaluate(() => {
+    const texto = (document.body && document.body.innerText || '').toLowerCase();
+    return texto.includes('verifique se você é humano') ||
+           texto.includes('verify you are human') ||
+           texto.includes('ray id') ||
+           texto.includes('cloudflare');
+  }).catch(() => false);
+
+  return temTextoChallenge;
+}
+
+async function localizarCamposLogin(page) {
+  const passwordCandidatos = ['input[type="password"]'];
+  let passwordInput = null;
+  for (const sel of passwordCandidatos) {
+    const loc = page.locator(sel).first();
+    if (await loc.count() > 0) {
+      try {
+        await loc.waitFor({ state: 'visible', timeout: 12000 });
+        passwordInput = loc;
+        break;
+      } catch (e) { /* tenta o próximo candidato */ }
+    }
+  }
+  if (!passwordInput) return { usernameInput: null, passwordInput: null };
+
+  const usernameCandidatos = [
+    'input[type="email"]',
+    'input[autocomplete="username"]',
+    'input[name="username"]',
+    'input#username',
+  ];
+  let usernameInput = null;
+  for (const sel of usernameCandidatos) {
+    const loc = page.locator(sel).first();
+    if (await loc.count() > 0) {
+      usernameInput = loc;
+      break;
+    }
+  }
+  if (!usernameInput) {
+    try {
+      const formComSenha = page.locator('form').filter({ has: page.locator('input[type="password"]') }).first();
+      const candidato = formComSenha.locator('input[type="text"], input:not([type])').first();
+      if (await candidato.count() > 0) usernameInput = candidato;
+    } catch (e) { /* segue sem username encontrado */ }
+  }
+
+  return { usernameInput, passwordInput };
+}
+
+async function lerSinaisNaPaginaDeLogin(page) {
+  const texto = await page.evaluate(() => (document.body && document.body.innerText) || '').catch(() => '');
+  const textoLower = texto.toLowerCase();
+
+  const padroesCredenciaisInvalidas = [
+    'usuário ou senha inválid',
+    'usuario ou senha invalid',
+    'credenciais inválidas',
+    'invalid username or password',
+    'invalid user credentials',
+    'senha incorreta',
+    'usuário incorreto',
+  ];
+  const padroesVerificacaoAdicional = [
+    'código de verificação',
+    'codigo de verificacao',
+    'digite o código',
+    'verification code',
+    'autenticação de dois fatores',
+    'two-factor',
+    '2fa',
+    'enviamos um código',
+    'recaptcha',
+    'hcaptcha',
+    'captcha',
+  ];
+
+  const matchCredenciais = padroesCredenciaisInvalidas.find(p => textoLower.includes(p));
+  const matchVerificacao = padroesVerificacaoAdicional.find(p => textoLower.includes(p));
+
+  return {
+    credenciaisInvalidas: !!matchCredenciais,
+    verificacaoAdicional: !!matchVerificacao,
+  };
+}
+
+// Faz o login automático de ponta a ponta (mesmo fluxo do test-tiny-login.js)
+// numa aba/contexto novo e isolado. NUNCA tenta contornar Cloudflare, CAPTCHA
+// ou verificação adicional — só detecta e reporta.
+// Devolve { ok: true, context, page } (chamador assume posse do contexto, já
+// autenticado e pronto em TINY_LIST_URL) ou { ok: false, status, detalhe }.
+async function tentarLoginAutomatico(browser) {
+  const username = process.env.TINY_USERNAME;
+  const senha = process.env.TINY_SENHA;
+  if (!username || !senha) {
+    return {
+      ok: false,
+      status: 'CREDENCIAIS_AUSENTES',
+      detalhe: 'TINY_USERNAME e/ou TINY_SENHA não configurados nos GitHub Secrets — não é possível tentar renovar sozinho.',
+    };
+  }
+
+  const context = await browser.newContext();
+  const page = await context.newPage();
+
+  try {
+    log('Renovação automática: abrindo tela de login do Tiny...');
+    await page.goto(TINY_LIST_URL, { waitUntil: 'domcontentloaded', timeout: 45000 });
+    await page.waitForLoadState('networkidle', { timeout: 20000 }).catch(() => {});
+
+    if (await detectarCloudflareChallenge(page)) {
+      await context.close();
+      return { ok: false, status: LOGIN_STATUS.CLOUDFLARE_CHALLENGE, detalhe: 'Sinal de desafio/verificação do Cloudflare detectado antes do formulário de login.' };
+    }
+
+    const { usernameInput, passwordInput } = await localizarCamposLogin(page);
+    if (!usernameInput || !passwordInput) {
+      await context.close();
+      return { ok: false, status: LOGIN_STATUS.LOGIN_INDETERMINADO, detalhe: 'Não foi possível localizar de forma confiável os campos de usuário e/ou senha na página.' };
+    }
+
+    await usernameInput.fill(username);
+    await passwordInput.fill(senha);
+
+    const botaoEntrar = page.getByRole('button', { name: /entrar/i }).first();
+    if (await botaoEntrar.count() > 0) {
+      await botaoEntrar.click();
+    } else {
+      await passwordInput.press('Enter');
+    }
+
+    await page.waitForLoadState('networkidle', { timeout: 25000 }).catch(() => {});
+    await page.waitForTimeout(2000);
+
+    const urlFinal = page.url();
+    const aindaEmTelaDeAuth = urlFinal.includes('accounts.tiny.com.br') || urlFinal.includes('/login');
+
+    if (await detectarCloudflareChallenge(page)) {
+      await context.close();
+      return { ok: false, status: LOGIN_STATUS.CLOUDFLARE_CHALLENGE, detalhe: 'Sinal de desafio/verificação do Cloudflare detectado após o envio do login.' };
+    }
+
+    if (!aindaEmTelaDeAuth && urlFinal.includes('erp.olist.com')) {
+      log('Renovação automática: login OK, sessão nova obtida.');
+      return { ok: true, context, page };
+    }
+
+    const sinais = await lerSinaisNaPaginaDeLogin(page);
+    await context.close();
+    if (sinais.credenciaisInvalidas) {
+      return { ok: false, status: LOGIN_STATUS.CREDENCIAIS_INVALIDAS, detalhe: 'Página de login reportou usuário/senha incorretos.' };
+    }
+    if (sinais.verificacaoAdicional) {
+      return { ok: false, status: LOGIN_STATUS.VERIFICACAO_ADICIONAL, detalhe: 'Detectado pedido de verificação adicional (código, 2FA ou captcha) que não aparece no login manual comum.' };
+    }
+    return { ok: false, status: LOGIN_STATUS.LOGIN_INDETERMINADO, detalhe: 'Após o envio do login, não foi possível confirmar sucesso nem nenhum dos cenários de falha conhecidos.' };
+  } catch (err) {
+    await context.close().catch(() => {});
+    return { ok: false, status: LOGIN_STATUS.LOGIN_INDETERMINADO, detalhe: `Erro inesperado durante o login automático: ${err.message}` };
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -355,17 +633,52 @@ function calcularDataDeCorte() {
   fs.writeFileSync(storageStatePath, Buffer.from(tinySessionB64, 'base64').toString('utf8'));
 
   const browser = await chromium.launch({ headless: true });
-  const context = await browser.newContext({ storageState: storageStatePath });
-  const page = await context.newPage();
+  let context;
+  let page;
 
-  log('Abrindo lista de Ordens de Produção no Tiny...');
-  await page.goto(TINY_LIST_URL, { waitUntil: 'networkidle' });
+  // 1) Verificação PROATIVA: a sessão salva está perto de expirar (ou já
+  //    expirou)? Se sim, nem tenta usá-la — já faz login automático direto.
+  const checagem = sessaoProximaDoVencimento(storageStatePath, RENEW_THRESHOLD_MINUTOS);
+  if (checagem.precisaRenovar) {
+    log(`Sessão salva perto de expirar (${checagem.motivo}). Renovando automaticamente antes de sincronizar...`);
+    const resultado = await tentarLoginAutomatico(browser);
+    if (!resultado.ok) {
+      alertarFalhaCritica('Renovação automática (proativa) da sessão do Tiny falhou.', [
+        `Status: ${resultado.status}`,
+        `Detalhe: ${resultado.detalhe}`,
+      ]);
+      await browser.close();
+      fs.unlinkSync(storageStatePath);
+      process.exit(1);
+    }
+    context = resultado.context;
+    page = resultado.page; // já está em TINY_LIST_URL, autenticado
+  } else {
+    log(`Checagem de validade da sessão: ${checagem.motivo}.`);
+    context = await browser.newContext({ storageState: storageStatePath });
+    page = await context.newPage();
 
-  if (page.url().includes('login')) {
-    log('ERRO: a sessão salva do Tiny expirou (fomos redirecionados para o login).');
-    log('Rode "node setup-tiny-session.js" de novo e atualize o secret TINY_SESSION_B64.');
-    await browser.close();
-    process.exit(1);
+    log('Abrindo lista de Ordens de Produção no Tiny...');
+    await page.goto(TINY_LIST_URL, { waitUntil: 'networkidle' });
+
+    // 2) Verificação REATIVA: mesmo sem sinal prévio de expiração, a sessão
+    //    salva se mostrou inválida na prática agora? Tenta renovar sozinho.
+    if (page.url().includes('login')) {
+      log('A sessão salva do Tiny se mostrou inválida (fomos redirecionados para o login). Tentando renovação automática...');
+      await context.close();
+      const resultado = await tentarLoginAutomatico(browser);
+      if (!resultado.ok) {
+        alertarFalhaCritica('A sessão salva do Tiny expirou e a renovação automática (reativa) também falhou.', [
+          `Status: ${resultado.status}`,
+          `Detalhe: ${resultado.detalhe}`,
+        ]);
+        await browser.close();
+        fs.unlinkSync(storageStatePath);
+        process.exit(1);
+      }
+      context = resultado.context;
+      page = resultado.page; // já está em TINY_LIST_URL, autenticado
+    }
   }
 
   const opsTinyTodas = await extrairOpsDoTiny(page);
