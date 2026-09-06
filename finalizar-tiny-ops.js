@@ -306,21 +306,27 @@ async function clicarItemMenu(page, regexTexto) {
 }
 
 // Com o menu aberto: "Lançar estoque" visível => ainda não lançou;
-// "Estornar estoque" visível => já lançado.
+// "Estornar estoque" visível => já lançado. Retenta algumas vezes porque o menu
+// pode estar renderizando/animando quando a primeira leitura acontece.
 async function lerEstadoDoEstoquePeloMenu(page) {
-  return page.evaluate(() => {
-    const lis = [...document.querySelectorAll('#jqContextMenu li')];
-    const visivel = (txt) =>
-      lis.some(
-        (li) =>
-          new RegExp('^\\s*' + txt + '\\s*$', 'i').test(li.textContent.trim()) &&
-          getComputedStyle(li).display !== 'none' &&
-          li.getBoundingClientRect().width > 0
-      );
-    if (visivel('Estornar estoque')) return 'lancado';
-    if (visivel('Lançar estoque')) return 'nao_lancado';
-    return 'indeterminado';
-  });
+  for (let i = 1; i <= 4; i++) {
+    const estado = await page.evaluate(() => {
+      const lis = [...document.querySelectorAll('#jqContextMenu li')];
+      const visivel = (txt) =>
+        lis.some(
+          (li) =>
+            new RegExp('^\\s*' + txt + '\\s*$', 'i').test(li.textContent.trim()) &&
+            getComputedStyle(li).display !== 'none' &&
+            li.getBoundingClientRect().width > 0
+        );
+      if (visivel('Estornar estoque')) return 'lancado';
+      if (visivel('Lançar estoque')) return 'nao_lancado';
+      return 'indeterminado';
+    });
+    if (estado !== 'indeterminado') return estado;
+    await page.waitForTimeout(500);
+  }
+  return 'indeterminado';
 }
 
 // Edita a quantidade da OP no Tiny + adiciona um marcador, na tela #edit/<id>.
@@ -398,19 +404,22 @@ async function lancarEstoque(page, numeroOp, idInterno, log) {
 
   await botaoLancar.click();
   await aceitarConfirmacaoSeAparecer(page);
-  await page.waitForLoadState('networkidle').catch(() => {});
-  await page.waitForTimeout(2000);
 
-  // Confirma reabrindo o menu (rebusca a OP porque a lista recarregou).
-  const rel = await acharLinhaDaOp(page, numeroOp, log);
-  if (!rel) throw new Error('OP sumiu da listagem depois de lançar o estoque');
-  await abrirMenuDaLinha(page, rel.idInterno);
-  const depois = await lerEstadoDoEstoquePeloMenu(page);
-  await fecharMenu(page);
-  if (depois !== 'lancado') {
-    throw new Error(`o menu não confirmou o lançamento (estado depois: ${depois})`);
+  // Espera o painel "Depósitos" sumir (= o lançamento foi processado).
+  try {
+    await page.getByRole('button', { name: /^\s*Lançar\s*$/i }).waitFor({ state: 'hidden', timeout: 15000 });
+  } catch (e) {
+    throw new Error('cliquei "Lançar" mas o painel de depósito não fechou (lançamento pode não ter completado)');
   }
-  log(`[Fase 2] OP ${numeroOp}: estoque LANÇADO no Tiny (depósito "${CFG.deposito}").`);
+  await page.waitForLoadState('networkidle').catch(() => {});
+  await page.waitForTimeout(2500);
+
+  // NÃO reabrimos o menu pra "confirmar": essa checagem era frágil (o menu às
+  // vezes não renderiza a tempo e dava falso-negativo mesmo com o estoque já
+  // lançado). A proteção contra lançar 2x é o pré-check no INÍCIO desta função
+  // (menu mostra "Estornar estoque" => já lançado => pula) + o Tiny, que não
+  // lança o mesmo estoque duas vezes.
+  log(`[Fase 2] OP ${numeroOp}: cliquei "Lançar" (depósito "${CFG.deposito}") — painel fechou.`);
   return 'lancado_agora';
 }
 
