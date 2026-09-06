@@ -134,25 +134,53 @@ async function salvarPrintDebug(page, apelido) {
 }
 
 // Vai pra listagem, busca a OP pelo número e devolve { idInterno, situacao }.
-// null => a OP realmente não está na listagem do Tiny (tratar como OP local).
-// Lança erro só se a listagem não carregar de jeito nenhum (problema transitório).
+// null => a busca respondeu e a OP não está no Tiny (tratar como OP local).
+// Lança erro só se a busca não responder de jeito nenhum (problema transitório).
+//
+// IMPORTANTE: a tabela de OPs do Tiny vem VAZIA numa sessão nova (o filtro fica
+// no localStorage, que o login automático não tem). Não dá pra esperar linhas
+// antes de buscar — é a própria busca (#pesquisa-mini + Enter) que carrega a
+// lista já filtrada pelo número.
 async function acharLinhaDaOp(page, numeroOp, log) {
-  for (let tentativa = 1; tentativa <= 2; tentativa++) {
-    await page.goto(TINY_LIST_URL, { waitUntil: 'networkidle' });
+  for (let tentativa = 1; tentativa <= 3; tentativa++) {
+    await page.goto(TINY_LIST_URL, { waitUntil: 'domcontentloaded' });
     if (page.url().includes('login')) throw new Error('SESSAO_EXPIROU_NO_MEIO');
 
     try {
-      await page.waitForSelector('#tabelaListagem tbody tr', { timeout: 15000 });
+      await page.waitForSelector('#pesquisa-mini', { state: 'visible', timeout: 20000 });
     } catch (e) {
-      if (tentativa === 2) throw new Error('a listagem de OPs do Tiny não carregou (nenhuma linha após 2 tentativas)');
-      await page.waitForTimeout(1500);
+      if (tentativa === 3) throw new Error('a tela de OPs do Tiny não carregou (campo de busca ausente após 3 tentativas)');
+      await page.waitForTimeout(2000);
       continue;
     }
 
+    await page.fill('#pesquisa-mini', '');
     await page.fill('#pesquisa-mini', String(numeroOp));
-    await page.keyboard.press('Enter');
-    await page.waitForLoadState('networkidle').catch(() => {});
-    await page.waitForTimeout(1600);
+    // Dois gatilhos: Enter no campo e o botão de lupa (onclick="listar();").
+    // O botão é o mais confiável; o Enter é reforço.
+    await page.locator('#pesquisa-mini').press('Enter').catch(() => {});
+    const botaoBusca = page.locator('button:has(i.fa-search), .input-group-btn button').first();
+    if (await botaoBusca.count()) {
+      await botaoBusca.click().catch(() => {});
+    }
+
+    // Espera a busca responder: OU aparece linha, OU aparece "sem resultados".
+    let respondeu = true;
+    try {
+      await page.waitForFunction(
+        () => {
+          const rows = document.querySelectorAll('#tabelaListagem tbody tr').length;
+          const semRes = /não retornou resultados|nao retornou resultados|nenhum registro/i.test(
+            document.body.innerText
+          );
+          return rows > 0 || semRes;
+        },
+        { timeout: 15000 }
+      );
+    } catch (e) {
+      respondeu = false;
+    }
+    await page.waitForTimeout(800);
 
     const res = await page.evaluate((num) => {
       const linhas = Array.from(document.querySelectorAll('#tabelaListagem tbody tr'));
@@ -168,23 +196,25 @@ async function acharLinhaDaOp(page, numeroOp, log) {
           break;
         }
       }
-      return { total: linhas.length, match };
+      const semRes = /não retornou resultados|nao retornou resultados|nenhum registro/i.test(
+        document.body.innerText
+      );
+      return { total: linhas.length, match, semRes };
     }, numeroOp);
 
     if (res.match && res.match.idInterno) {
       return { idInterno: res.match.idInterno, situacao: situacaoPelaClasse(res.match.ledClass) };
     }
-    // Lista carregou, tem linhas, e a OP não está entre elas -> não existe no Tiny.
-    if (res.total > 0) {
-      log(`[Fase 2] OP ${numeroOp}: não está na listagem do Tiny (${res.total} linha(s) no resultado da busca).`);
+    if (res.semRes || (respondeu && res.total > 0)) {
+      log(`[Fase 2] OP ${numeroOp}: a busca no Tiny respondeu e a OP não apareceu (linhas=${res.total}, semResultado=${res.semRes}).`);
       return null;
     }
-    // 0 linhas depois da busca: pode ser timing — tenta de novo.
-    if (tentativa === 2) {
-      log(`[Fase 2] OP ${numeroOp}: busca no Tiny voltou sem nenhuma linha (2x) — tratando como não encontrada.`);
-      return null;
+    // Não respondeu (nem linha, nem "sem resultados") — problema transitório, tenta de novo.
+    if (tentativa === 3) {
+      throw new Error('a busca de OPs no Tiny não respondeu após 3 tentativas');
     }
-    await page.waitForTimeout(1500);
+    log(`[Fase 2] OP ${numeroOp}: busca no Tiny não respondeu (tentativa ${tentativa}/3), repetindo...`);
+    await page.waitForTimeout(2000);
   }
   return null;
 }
