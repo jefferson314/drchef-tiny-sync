@@ -609,7 +609,9 @@ async function registrarFalha({ log, alertarFalhaCritica }, docSnap, err) {
     tinyEstoqueTentativas: tentativas,
     tinyEstoqueUltimoErro: `${new Date().toISOString()} — ${err.message}`,
   };
-  const bloqueou = tentativas >= CFG.maxTentativas;
+  // Run manual mirando OPs específicas (SO_OP) é modo de teste/depuração — não
+  // bloqueia a OP permanentemente por acúmulo de falhas.
+  const bloqueou = !CFG.soOps.length && tentativas >= CFG.maxTentativas;
   if (bloqueou) patch.tinyEstoqueBloqueado = true;
 
   try {
