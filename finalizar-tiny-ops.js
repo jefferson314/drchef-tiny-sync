@@ -504,13 +504,23 @@ async function finalizarSituacao(page, numeroOp, idInterno, situacaoAtual, log) 
 // Recebe browser page já autenticada. Nunca lança pra fora.
 // -------------------------------------------------------------------------
 async function marcarOpsEmAndamento({ page, log }, opsNovas) {
-  if (String(process.env.TINY_SITUACAO_ANDAMENTO || 'false').toLowerCase() !== 'true') {
-    log('[Situação] marcar "Em Andamento" no Tiny está desligado (TINY_SITUACAO_ANDAMENTO != true).');
+  const ligado = String(process.env.TINY_SITUACAO_ANDAMENTO || 'false').toLowerCase() === 'true';
+  // TINY_SITUACAO_SO_OP: números avulsos, força marcar essas mesmo já importadas
+  // (modo teste — também loga o EAN que o buscarEAN acha).
+  const soOps = String(process.env.TINY_SITUACAO_SO_OP || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+
+  if (!ligado && !soOps.length) {
+    log('[Situação] marcar "Em Andamento" no Tiny está desligado (TINY_SITUACAO_ANDAMENTO != true e sem SO_OP).');
     return;
   }
-  const lista = (opsNovas || []).filter((o) => o && o.numero);
+
+  let lista = ligado ? (opsNovas || []).filter((o) => o && o.numero) : [];
+  if (soOps.length) lista = soOps.map((n) => ({ numero: n, _teste: true }));
   if (!lista.length) return;
-  log(`[Situação] marcando ${lista.length} OP(s) nova(s) como "Em Andamento" no Tiny...`);
+  log(`[Situação] marcando ${lista.length} OP(s) como "Em Andamento" no Tiny${soOps.length ? ' (modo teste SO_OP)' : ''}...`);
 
   const aceitarDialogo = (d) => d.accept().catch(() => {});
   page.on('dialog', aceitarDialogo);

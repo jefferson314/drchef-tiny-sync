@@ -795,8 +795,24 @@ function calcularDataDeCorte() {
 
   log(`Fase 1 concluída. ${criadas} OP(s) nova(s) criada(s) em "A Cortar".`);
 
+  // Modo teste: TINY_SITUACAO_SO_OP="3527" -> testa o buscarEAN nessas OPs e loga.
+  const testarOps = String(process.env.TINY_SITUACAO_SO_OP || '')
+    .split(',')
+    .map((s) => s.trim())
+    .filter(Boolean);
+  for (const num of testarOps) {
+    const opT = opsTinyTodas.find((o) => String(o.numero) === num);
+    if (!opT) {
+      log(`[Teste EAN] OP ${num}: não está na lista de OPs em aberto do Tiny — pulo o teste de EAN.`);
+      continue;
+    }
+    const refTeste = (opT.skuDescricao.split(' - ')[0] || '').trim();
+    const eanTeste = await buscarEAN(page, refTeste);
+    log(`[Teste EAN] OP ${num} (ref "${refTeste}"): EAN encontrado = "${eanTeste || '(vazio)'}"`);
+  }
+
   // Marca as OPs recém-criadas como "Em Andamento" no Tiny (sai de Pendente).
-  // Controlado por TINY_SITUACAO_ANDAMENTO; nunca derruba a rodada.
+  // Controlado por TINY_SITUACAO_ANDAMENTO / TINY_SITUACAO_SO_OP; nunca derruba a rodada.
   try {
     await marcarOpsEmAndamento({ page, log }, opsCriadas);
   } catch (err) {

@@ -23,6 +23,10 @@ on:
         description: 'Fase 1: marcar OP nova como "Em Andamento" no Tiny (força ligado nesta rodada)'
         type: boolean
         default: false
+      situacao_so_op:
+        description: 'Teste: marcar essas OPs (números por vírgula) como "Em Andamento" + testar o EAN nelas, mesmo já importadas'
+        type: string
+        default: ''
 
 # Nunca deixa duas execuções rodando ao mesmo tempo — evita lançar o mesmo
 # estoque duas vezes se uma rodada demorar mais que o intervalo do cron.
@@ -78,6 +82,7 @@ jobs:
           # quando você marca a caixa "situacao_andamento" no Run workflow (teste).
           # Pra ligar PERMANENTE: troque a linha abaixo por  TINY_SITUACAO_ANDAMENTO: 'true'
           TINY_SITUACAO_ANDAMENTO: ${{ github.event.inputs.situacao_andamento == 'true' && 'true' || 'false' }}
+          TINY_SITUACAO_SO_OP: ${{ github.event.inputs.situacao_so_op || '' }}
           # --- Fase 2: lançar estoque no Tiny ao entrar em "Costura Finalizada" ---
           # COMEÇA DESLIGADA de propósito (mexe em estoque de verdade). Depois de
           # testar com "Run workflow" em modo simulação, troque para 'true' aqui.
