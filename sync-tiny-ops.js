@@ -433,59 +433,104 @@ async function buscarTecido(page, idInternoTiny) {
 async function buscarEAN(page, ref) {
   if (!ref) return '';
   try {
-    await page.goto(PRODUCTS_LIST_URL, { waitUntil: 'networkidle' });
+    await page.goto(PRODUCTS_LIST_URL, { waitUntil: 'domcontentloaded' });
+    await page.waitForSelector('#pesquisa-mini', { state: 'visible', timeout: 20000 });
 
-    // Garante que nenhum filtro de uma busca anterior (ex: "variações") está
-    // escondendo o produto que queremos.
-    const limparFiltros = await page.$('a:has-text("limpar filtros")');
-    if (limparFiltros) {
-      await limparFiltros.click();
-      await page.waitForLoadState('networkidle');
+    // Limpa qualquer filtro salvo (situação/variações/etc) e dispara a busca.
+    // A lista de produtos, igual à de OPs, não filtra com Enter sintético — usa
+    // a função pesquisarMini()/listar() da própria tela. Colunas ficam ocultas
+    // pelo layout responsivo, então lemos SEMPRE via textContent.
+    await page.evaluate(() => {
+      try { if (window.removerTodosFiltros) window.removerTodosFiltros(); } catch (_) {}
+    });
+    await page.fill('#pesquisa-mini', '');
+    await page.fill('#pesquisa-mini', String(ref));
+    await page.locator('#pesquisa-mini').press('Enter').catch(() => {});
+    await page.evaluate(() => {
+      try {
+        if (window.pesquisarMini) window.pesquisarMini();
+        else if (window.listar) window.listar();
+      } catch (_) {}
+    });
+    await page.waitForLoadState('networkidle').catch(() => {});
+    await page.waitForTimeout(2500);
+
+    // Lê a tabela toda de uma vez, mapeando colunas pelo cabeçalho (índices fixos
+    // quebram com o footable). Devolve as linhas + índice das colunas SKU/EAN e
+    // se a linha tem link de "variações".
+    const dados = await page.evaluate(() => {
+      const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+      const ths = [...document.querySelectorAll('#tabelaListagem thead th')];
+      let colSku = -1;
+      let colEan = -1;
+      ths.forEach((th, i) => {
+        const t = norm(th.textContent);
+        if (colSku < 0 && /c[oó]digo.*sku/.test(t)) colSku = i;
+        if (colEan < 0 && /(gtin|ean)/.test(t)) colEan = i;
+      });
+      const rows = [...document.querySelectorAll('#tabelaListagem tbody tr')].map((tr) => {
+        const tds = [...tr.querySelectorAll('td')];
+        return {
+          sku: colSku >= 0 && tds[colSku] ? tds[colSku].textContent.trim() : '',
+          ean: colEan >= 0 && tds[colEan] ? tds[colEan].textContent.trim() : '',
+          temVariacoes: !!tr.querySelector('a.link'),
+        };
+      });
+      const semRes = /não retornou resultados|nao retornou resultados|nenhum registro/i.test(
+        document.body.innerText
+      );
+      return { colSku, colEan, rows, semRes };
+    });
+
+    if (dados.semRes || !dados.rows.length) {
+      log(`OP ref "${ref}": busca de produto no Tiny voltou vazia (colSku=${dados.colSku}, colEan=${dados.colEan}).`);
+      return '';
     }
 
-    await page.fill('#pesquisa-mini', ref);
-    await page.keyboard.press('Enter');
-    await page.waitForLoadState('networkidle');
+    // 1) Match direto do produto (produto simples).
+    const direto = dados.rows.find((r) => r.sku && r.sku === String(ref));
+    if (direto && direto.ean) return direto.ean;
 
-    const semResultado = await page.locator('text=Sua pesquisa não retornou resultados').count();
-    if (semResultado > 0) return '';
-
-    await page.waitForSelector('#tabelaListagem tbody tr', { timeout: 15000 });
-    const linhas = page.locator('#tabelaListagem tbody tr');
-    const totalLinhas = await linhas.count();
-
-    for (let i = 0; i < totalLinhas; i++) {
-      const linha = linhas.nth(i);
-      // Coluna "Código (SKU)" do produto "pai" (índice 4 na listagem).
-      const codigoBase = (await linha.locator('td').nth(4).innerText()).trim();
-
-      if (codigoBase === ref) {
-        // Produto simples (sem variações): a célula seguinte já é o EAN.
-        return (await linha.locator('td').nth(5).innerText()).trim();
+    // 2) Produto com variações: abre o link e procura a variação com esse SKU.
+    for (let i = 0; i < dados.rows.length; i++) {
+      if (!dados.rows[i].temVariacoes) continue;
+      const link = page.locator('#tabelaListagem tbody tr a.link').nth(
+        dados.rows.slice(0, i + 1).filter((r) => r.temVariacoes).length - 1
+      );
+      if (!(await link.count())) continue;
+      await link.click().catch(() => {});
+      try {
+        await page.waitForSelector('#tabela_variacoes tbody tr', { timeout: 12000 });
+      } catch (_) {
+        await page.keyboard.press('Escape').catch(() => {});
+        continue;
       }
-
-      const linkVariacoes = linha.locator('a.link', { hasText: 'variaç' });
-      if (await linkVariacoes.count() === 0) continue;
-
-      await linkVariacoes.first().click();
-      await page.waitForSelector('#tabela_variacoes tbody tr', { timeout: 15000 });
-      const linhasVar = page.locator('#tabela_variacoes tbody tr');
-      const totalVar = await linhasVar.count();
-      let eanEncontrado = '';
-      for (let j = 0; j < totalVar; j++) {
-        // Colunas da tabela de variações: [0] thumb, [1] Variação,
-        // [2] Código (SKU), [3] GTIN/EAN, ...
-        const sku = (await linhasVar.nth(j).locator('td').nth(2).innerText()).trim();
-        if (sku === ref) {
-          eanEncontrado = (await linhasVar.nth(j).locator('td').nth(3).innerText()).trim();
-          break;
+      const ean = await page.evaluate((alvo) => {
+        const norm = (s) => (s || '').replace(/\s+/g, ' ').trim().toLowerCase();
+        const ths = [...document.querySelectorAll('#tabela_variacoes thead th')];
+        let cSku = -1;
+        let cEan = -1;
+        ths.forEach((th, idx) => {
+          const t = norm(th.textContent);
+          if (cSku < 0 && /c[oó]digo.*sku/.test(t)) cSku = idx;
+          if (cEan < 0 && /(gtin|ean)/.test(t)) cEan = idx;
+        });
+        if (cSku < 0) cSku = 2;
+        if (cEan < 0) cEan = 3;
+        for (const tr of document.querySelectorAll('#tabela_variacoes tbody tr')) {
+          const tds = [...tr.querySelectorAll('td')];
+          if (tds[cSku] && tds[cSku].textContent.trim() === String(alvo)) {
+            return tds[cEan] ? tds[cEan].textContent.trim() : '';
+          }
         }
-      }
-      const fechar = page.locator('text=fechar').first();
-      if (await fechar.count()) await fechar.click().catch(() => {});
-      if (eanEncontrado) return eanEncontrado;
+        return '';
+      }, String(ref));
+      await page.locator('text=fechar').first().click().catch(() => {});
+      await page.keyboard.press('Escape').catch(() => {});
+      if (ean) return ean;
     }
 
+    log(`OP ref "${ref}": produto encontrado na busca mas sem EAN correspondente (${dados.rows.length} linha(s)).`);
     return '';
   } catch (err) {
     log(`Aviso: não consegui buscar o EAN do produto "${ref}": ${err.message}`);
