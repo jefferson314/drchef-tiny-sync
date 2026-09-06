@@ -5,7 +5,22 @@ on:
     # A cada 20 minutos (dentro da faixa de 15-30 min pedida).
     # Horário em UTC — GitHub Actions não converte para horário de Brasília.
     - cron: '*/20 * * * *'
-  workflow_dispatch: {} # permite rodar manualmente pela aba "Actions" do GitHub
+  workflow_dispatch:
+    inputs:
+      estoque_dry_run:
+        description: 'Fase 2 em modo simulação (não lança nada no Tiny)'
+        type: boolean
+        default: false
+      estoque_so_op:
+        description: 'Fase 2: rodar só nessas OPs (números separados por vírgula, ex 3526)'
+        type: string
+        default: ''
+
+# Nunca deixa duas execuções rodando ao mesmo tempo — evita lançar o mesmo
+# estoque duas vezes se uma rodada demorar mais que o intervalo do cron.
+concurrency:
+  group: sync-tiny
+  cancel-in-progress: false
 
 jobs:
   sync:
@@ -50,4 +65,22 @@ jobs:
           # ainda estejam "em aberto" no Tiny. Pode editar esse valor direto
           # aqui quando quiser mudar o corte.
           DATA_CORTE: '2026-08-01'
+          # --- Fase 2: lançar estoque no Tiny ao entrar em "Costura Finalizada" ---
+          # COMEÇA DESLIGADA de propósito (mexe em estoque de verdade). Depois de
+          # testar com "Run workflow" em modo simulação, troque para 'true' aqui.
+          TINY_ESTOQUE_ENABLED: 'false'
+          # Modo simulação / OP específica: controlados pelo "Run workflow" manual.
+          TINY_ESTOQUE_DRY_RUN: ${{ github.event.inputs.estoque_dry_run || 'false' }}
+          TINY_ESTOQUE_SO_OP: ${{ github.event.inputs.estoque_so_op || '' }}
+          # TINY_ESTOQUE_DEPOSITO: 'Geral'         # depósito de entrada (padrão Geral)
+          # TINY_ESTOQUE_MAX_TENTATIVAS: '5'       # bloqueia a OP depois de N falhas
         run: npm run sync
+
+      - name: Guardar prints de erro da Fase 2 (se houver)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: fase2-debug
+          path: fase2-debug/
+          if-no-files-found: ignore
+          retention-days: 7

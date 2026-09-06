@@ -80,6 +80,7 @@ const { chromium } = require('playwright');
 const admin = require('firebase-admin');
 const fs = require('fs');
 const path = require('path');
+const { finalizarOpsCosturaFinalizada } = require('./finalizar-tiny-ops');
 
 const TINY_LIST_URL = 'https://erp.olist.com/ordens_producao';
 const PRODUCTS_LIST_URL = 'https://erp.olist.com/produtos';
@@ -725,8 +726,6 @@ function calcularDataDeCorte() {
     }
   }
 
-  await browser.close();
-
   // --- Cria as que faltam ---
   let criadas = 0;
   for (const opTiny of novasOps) {
@@ -747,7 +746,22 @@ function calcularDataDeCorte() {
     log(`Criada no Dr Chef: OP ${opTiny.numero} (${form.modelo} / ${form.color} / ${form.size})`);
   }
 
-  log(`Sincronização concluída. ${criadas} OP(s) nova(s) criada(s) em "A Cortar".`);
+  log(`Fase 1 concluída. ${criadas} OP(s) nova(s) criada(s) em "A Cortar".`);
+
+  // -------------------------------------------------------------------------
+  // FASE 2: OPs que chegaram em "Costura Finalizada" no Dr Chef -> lança o
+  // estoque pela OP no Tiny (baixa insumo + entrada + marketplace) e finaliza.
+  // Nunca derruba a Fase 1: qualquer erro é só logado/alertado.
+  // -------------------------------------------------------------------------
+  try {
+    await finalizarOpsCosturaFinalizada({ page, db, log, alertarFalhaCritica });
+  } catch (err) {
+    alertarFalhaCritica('A Fase 2 (lançar estoque no Tiny) falhou de forma inesperada.', [err.message]);
+  }
+
+  await browser.close();
+
+  log('Sincronização concluída.');
   fs.unlinkSync(storageStatePath);
   process.exit(0);
 })().catch(err => {
