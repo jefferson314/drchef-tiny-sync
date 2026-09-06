@@ -137,10 +137,12 @@ async function salvarPrintDebug(page, apelido) {
 // null => a busca respondeu e a OP não está no Tiny (tratar como OP local).
 // Lança erro só se a busca não responder de jeito nenhum (problema transitório).
 //
-// IMPORTANTE: a tabela de OPs do Tiny vem VAZIA numa sessão nova (o filtro fica
-// no localStorage, que o login automático não tem). Não dá pra esperar linhas
-// antes de buscar — é a própria busca (#pesquisa-mini + Enter) que carrega a
-// lista já filtrada pelo número.
+// IMPORTANTE (2 pegadinhas da tela de OPs do Tiny):
+//  1) a tabela vem VAZIA numa sessão nova — é a própria busca que carrega a lista;
+//  2) a sessão salva pode ter um filtro de situação (ex "Em aberto") no
+//     localStorage. Se a OP no Tiny estiver "Finalizada"/"Em andamento", a busca
+//     dentro desse filtro devolve "sem resultados". Por isso clicamos a aba
+//     "Todas" antes de buscar, pra a busca cobrir qualquer situação.
 async function acharLinhaDaOp(page, numeroOp, log) {
   for (let tentativa = 1; tentativa <= 3; tentativa++) {
     await page.goto(TINY_LIST_URL, { waitUntil: 'domcontentloaded' });
@@ -152,6 +154,20 @@ async function acharLinhaDaOp(page, numeroOp, log) {
       if (tentativa === 3) throw new Error('a tela de OPs do Tiny não carregou (campo de busca ausente após 3 tentativas)');
       await page.waitForTimeout(2000);
       continue;
+    }
+
+    // Limpa o filtro de situação: clica a aba "Todas".
+    try {
+      const abaTodas = page
+        .locator('a.item-sit')
+        .filter({ hasText: /^\s*Todas\b/i })
+        .first();
+      if (await abaTodas.count()) {
+        await abaTodas.click();
+        await page.waitForTimeout(1500);
+      }
+    } catch (e) {
+      log(`[Fase 2] OP ${numeroOp}: não consegui clicar na aba "Todas" (${e.message}) — sigo assim mesmo.`);
     }
 
     await page.fill('#pesquisa-mini', '');
