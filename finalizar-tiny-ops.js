@@ -542,10 +542,12 @@ async function registrarFalha({ log, alertarFalhaCritica }, docSnap, err) {
  * NUNCA lança pra fora: qualquer erro é logado/alertado e a rodada segue.
  */
 async function finalizarOpsCosturaFinalizada({ page, db, log, alertarFalhaCritica }) {
-  // Modo simulação sempre pode rodar (não altera nada) — bom pra testar mesmo
-  // com a Fase 2 ainda desligada.
-  if (!CFG.enabled && !CFG.dryRun) {
-    log('[Fase 2] desligada (TINY_ESTOQUE_ENABLED=false).');
+  // A Fase 2 roda quando: está ligada (TINY_ESTOQUE_ENABLED), OU é simulação
+  // (DRY_RUN — não altera nada), OU você pediu OPs específicas no "Run workflow"
+  // (TINY_ESTOQUE_SO_OP — é justamente o modo de testar 1 OP com a feature ainda
+  // desligada).
+  if (!CFG.enabled && !CFG.dryRun && !CFG.soOps.length) {
+    log('[Fase 2] desligada (TINY_ESTOQUE_ENABLED=false e sem DRY_RUN / SO_OP).');
     return;
   }
   log(
