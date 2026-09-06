@@ -483,22 +483,29 @@ async function finalizarOpsCosturaFinalizada({ page, db, log, alertarFalhaCritic
 
   try {
     const snap = await db.collection('orders').where('status', '==', 'costuraFinalizada').get();
+    log(`[Fase 2] ${snap.size} OP(s) com status "costuraFinalizada" no Firestore.`);
 
     const candidatas = [];
     snap.forEach((docSnap) => {
       const d = docSnap.data();
-      if (d.tinyEstoqueLancado === true) return;
-      if (d.tinyEstoqueBloqueado === true) return;
-      if (!ehOrigemTiny(d)) return;
-      if (CFG.soOps.length && !CFG.soOps.includes(String(d.op || '').trim())) return;
+      const num = String(d.op || '(sem número)').trim();
+      const motivos = [];
+      if (d.tinyEstoqueLancado === true) motivos.push('já lançado (tinyEstoqueLancado)');
+      if (d.tinyEstoqueBloqueado === true) motivos.push('bloqueado (tinyEstoqueBloqueado)');
+      if (!ehOrigemTiny(d)) motivos.push('não é origem Tiny (sem history.by="sync-tiny" nem obs de importação)');
+      if (CFG.soOps.length && !CFG.soOps.includes(num)) motivos.push(`fora do filtro TINY_ESTOQUE_SO_OP (${CFG.soOps.join(',')})`);
+      if (motivos.length) {
+        log(`[Fase 2]   OP ${num}: pulada — ${motivos.join('; ')}`);
+        return;
+      }
       candidatas.push(docSnap);
     });
 
     if (!candidatas.length) {
-      log('[Fase 2] nenhuma OP de origem Tiny em "Costura Finalizada" pendente.');
+      log('[Fase 2] nenhuma OP de origem Tiny em "Costura Finalizada" pendente de lançamento.');
       return;
     }
-    log(`[Fase 2] ${candidatas.length} OP(s) a processar.`);
+    log(`[Fase 2] ${candidatas.length} OP(s) a processar: ${candidatas.map((d) => d.data().op).join(', ')}.`);
 
     for (const docSnap of candidatas) {
       try {
