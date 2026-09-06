@@ -240,39 +240,87 @@ function linhaLocator(page, idInterno) {
   return page.locator(`#tabelaListagem tbody tr[id="${idInterno}"]`);
 }
 
-// Abre o menu "..." (button-navigate) da linha e espera o dropdown compartilhado.
-// Uma tentativa de retry porque o dropdown do Tiny às vezes não abre no 1º clique.
+// O menu "..." do Tiny é um jQuery contextMenu compartilhado (#jqContextMenu).
+// Quando aberto, tem a classe "open" e fica POR CIMA de tudo — se não fechar,
+// intercepta o clique do botão da próxima linha. E o Escape NÃO fecha: só
+// fecha clicando fora (ex: no campo de busca).
+
+async function menuEstaAberto(page) {
+  return page.evaluate(() => {
+    const m = document.querySelector('#jqContextMenu');
+    return !!(m && /\bopen\b/.test(m.className));
+  });
+}
+
+async function fecharMenu(page) {
+  for (let i = 0; i < 4; i++) {
+    if (!(await menuEstaAberto(page))) return;
+    await page.locator('#pesquisa-mini').click({ force: true }).catch(() => {});
+    await page.waitForTimeout(300);
+  }
+}
+
+// Abre o menu "..." da linha. Fecha qualquer menu aberto ANTES (o menu é
+// compartilhado). Retry porque às vezes não abre no 1º clique.
 async function abrirMenuDaLinha(page, idInterno) {
   const gatilho = linhaLocator(page, idInterno).locator('td .button-navigate').first();
-  for (let tentativa = 1; tentativa <= 2; tentativa++) {
-    await gatilho.click();
+  for (let tentativa = 1; tentativa <= 3; tentativa++) {
+    await fecharMenu(page);
+    await gatilho.scrollIntoViewIfNeeded().catch(() => {});
+    await gatilho.click({ force: true }).catch(() => {});
     try {
-      await page
-        .locator('.listaMenu.dropdown-menu:visible')
-        .waitFor({ state: 'visible', timeout: 5000 });
-      await page.waitForTimeout(250);
+      await page.waitForFunction(
+        () => {
+          const m = document.querySelector('#jqContextMenu');
+          if (!m || !/\bopen\b/.test(m.className)) return false;
+          return m.querySelectorAll('li').length > 0;
+        },
+        { timeout: 4000 }
+      );
+      await page.waitForTimeout(300);
       return;
     } catch (e) {
-      if (tentativa === 2) throw new Error('não consegui abrir o menu "..." da OP');
-      await page.waitForTimeout(400);
+      if (tentativa === 3) throw new Error('não consegui abrir o menu "..." da OP');
+      await page.waitForTimeout(600);
     }
   }
 }
 
-async function fecharMenu(page) {
-  await page.keyboard.press('Escape').catch(() => {});
-  await page.waitForTimeout(150);
+// Clica um item do menu (pelo texto). O <li> não tem <a> — o clique é no <li>.
+// Feito via evaluate porque o menu do Tiny é jQuery com delegação de eventos.
+async function clicarItemMenu(page, regexTexto) {
+  const ok = await page.evaluate((re) => {
+    const rx = new RegExp(re, 'i');
+    const li = [...document.querySelectorAll('#jqContextMenu li')].find(
+      (el) =>
+        rx.test(el.textContent.trim()) &&
+        getComputedStyle(el).display !== 'none' &&
+        el.getBoundingClientRect().width > 0
+    );
+    if (!li) return false;
+    (li.querySelector('a') || li).click();
+    return true;
+  }, regexTexto);
+  if (!ok) throw new Error(`item de menu "${regexTexto}" não encontrado/visível`);
+  await page.waitForTimeout(600);
 }
 
 // Com o menu aberto: "Lançar estoque" visível => ainda não lançou;
 // "Estornar estoque" visível => já lançado.
 async function lerEstadoDoEstoquePeloMenu(page) {
-  const menu = page.locator('.listaMenu.dropdown-menu:visible');
-  const estornar = menu.locator('li', { hasText: /^\s*Estornar estoque\s*$/ });
-  const lancar = menu.locator('li', { hasText: /^\s*Lançar estoque\s*$/ });
-  if ((await estornar.count()) && (await estornar.first().isVisible())) return 'lancado';
-  if ((await lancar.count()) && (await lancar.first().isVisible())) return 'nao_lancado';
-  return 'indeterminado';
+  return page.evaluate(() => {
+    const lis = [...document.querySelectorAll('#jqContextMenu li')];
+    const visivel = (txt) =>
+      lis.some(
+        (li) =>
+          new RegExp('^\\s*' + txt + '\\s*$', 'i').test(li.textContent.trim()) &&
+          getComputedStyle(li).display !== 'none' &&
+          li.getBoundingClientRect().width > 0
+      );
+    if (visivel('Estornar estoque')) return 'lancado';
+    if (visivel('Lançar estoque')) return 'nao_lancado';
+    return 'indeterminado';
+  });
 }
 
 // Edita a quantidade da OP no Tiny + adiciona um marcador, na tela #edit/<id>.
@@ -334,10 +382,7 @@ async function lancarEstoque(page, numeroOp, idInterno, log) {
     throw new Error('menu da OP não mostrou "Lançar estoque" nem "Estornar estoque"');
   }
 
-  await page
-    .locator('.listaMenu.dropdown-menu:visible li', { hasText: /^\s*Lançar estoque\s*$/ })
-    .first()
-    .click();
+  await clicarItemMenu(page, '^\\s*Lançar estoque\\s*$');
 
   const botaoLancar = page.getByRole('button', { name: /^\s*Lançar\s*$/i });
   await botaoLancar.waitFor({ state: 'visible', timeout: 10000 });
@@ -377,11 +422,19 @@ async function finalizarSituacao(page, numeroOp, idInterno, situacaoAtual, log) 
     return true;
   }
   await abrirMenuDaLinha(page, idInterno);
-  const verde = page
-    .locator('.listaMenu.dropdown-menu:visible .dropdown-item-situacoes .icon-led-green')
-    .first();
-  await verde.waitFor({ state: 'visible', timeout: 6000 });
-  await verde.click();
+  const cliqueiVerde = await page.evaluate(() => {
+    const dot = document.querySelector(
+      '#jqContextMenu .dropdown-item-situacoes .icon-led-green'
+    );
+    if (!dot || dot.getBoundingClientRect().width === 0) return false;
+    dot.click();
+    return true;
+  });
+  if (!cliqueiVerde) {
+    await fecharMenu(page);
+    throw new Error('bolinha verde (Finalizada) não encontrada no menu "alterar situação"');
+  }
+  await page.waitForTimeout(600);
   await aceitarConfirmacaoSeAparecer(page);
   await page.waitForLoadState('networkidle').catch(() => {});
   await page.waitForTimeout(1800);
