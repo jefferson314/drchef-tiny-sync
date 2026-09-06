@@ -80,7 +80,7 @@ const { chromium } = require('playwright');
 const admin = require('firebase-admin');
 const fs = require('fs');
 const path = require('path');
-const { finalizarOpsCosturaFinalizada } = require('./finalizar-tiny-ops');
+const { finalizarOpsCosturaFinalizada, marcarOpsEmAndamento } = require('./finalizar-tiny-ops');
 
 const TINY_LIST_URL = 'https://erp.olist.com/ordens_producao';
 const PRODUCTS_LIST_URL = 'https://erp.olist.com/produtos';
@@ -728,6 +728,7 @@ function calcularDataDeCorte() {
 
   // --- Cria as que faltam ---
   let criadas = 0;
+  const opsCriadas = [];
   for (const opTiny of novasOps) {
     const form = tinyParaDrChef(opTiny);
     // ISO string (não epoch numérico) para bater com o formato que o próprio
@@ -743,10 +744,19 @@ function calcularDataDeCorte() {
 
     await db.collection('orders').doc(novoDoc.id).set(novoDoc);
     criadas++;
+    opsCriadas.push({ numero: opTiny.numero, idInternoTiny: opTiny.idInternoTiny });
     log(`Criada no Dr Chef: OP ${opTiny.numero} (${form.modelo} / ${form.color} / ${form.size})`);
   }
 
   log(`Fase 1 concluída. ${criadas} OP(s) nova(s) criada(s) em "A Cortar".`);
+
+  // Marca as OPs recém-criadas como "Em Andamento" no Tiny (sai de Pendente).
+  // Controlado por TINY_SITUACAO_ANDAMENTO; nunca derruba a rodada.
+  try {
+    await marcarOpsEmAndamento({ page, log }, opsCriadas);
+  } catch (err) {
+    log(`Aviso: passo "marcar Em Andamento no Tiny" falhou: ${err.message}`);
+  }
 
   // -------------------------------------------------------------------------
   // FASE 2: OPs que chegaram em "Costura Finalizada" no Dr Chef -> lança o

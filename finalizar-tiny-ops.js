@@ -442,48 +442,102 @@ async function lancarEstoque(page, numeroOp, idInterno, log) {
   return 'lancado_agora';
 }
 
-// Menu "..." -> "Alterar situação" -> bolinha verde (Finalizada).
+// Menu "..." -> "Alterar situação" -> bolinha da cor alvo. Clique REAL do
+// Playwright (eventos sintéticos não passam pelo ctxClickHandler do Tiny).
+// alvo: 'em_andamento' (bolinha azul, data-situacao 1) | 'finalizada' (verde, 2).
 // Devolve true/false (conseguiu confirmar a mudança pela situação da linha).
-async function finalizarSituacao(page, numeroOp, idInterno, situacaoAtual, log) {
-  if (situacaoAtual === 'finalizada') {
-    log(`[Fase 2] OP ${numeroOp}: já estava "Finalizada" no Tiny.`);
+const COR_SITUACAO = { em_andamento: 'blue', finalizada: 'green' };
+const RANK_SITUACAO = { em_aberto: 0, em_andamento: 1, finalizada: 2, cancelada: -1 };
+
+async function alterarSituacao(page, tag, numeroOp, idInterno, situacaoAtual, alvo, log) {
+  if (situacaoAtual === alvo) {
+    log(`${tag} OP ${numeroOp}: situação no Tiny já era "${alvo}".`);
+    return true;
+  }
+  // Não "volta" situação: se já está mais adiante que o alvo, não mexe.
+  if ((RANK_SITUACAO[situacaoAtual] ?? 0) > (RANK_SITUACAO[alvo] ?? 0)) {
+    log(`${tag} OP ${numeroOp}: situação no Tiny é "${situacaoAtual}" (adiante de "${alvo}") — não altero.`);
     return true;
   }
 
+  const cor = COR_SITUACAO[alvo];
   for (let tentativa = 1; tentativa <= 2; tentativa++) {
     await abrirMenuDaLinha(page, idInterno);
-
-    // Clique REAL do Playwright na bolinha verde (data-situacao="2" = Finalizada).
-    // Eventos sintéticos não passam pelo ctxClickHandler do Tiny (não são trusted).
-    const verde = page
-      .locator('#jqContextMenu .icon-led-green.situacaoAlteracao, #jqContextMenu .dropdown-item-situacoes .icon-led-green')
+    const bolinha = page
+      .locator(`#jqContextMenu .icon-led-${cor}.situacaoAlteracao, #jqContextMenu .dropdown-item-situacoes .icon-led-${cor}`)
       .first();
     try {
-      await verde.waitFor({ state: 'visible', timeout: 5000 });
-      await verde.hover().catch(() => {});
-      await verde.click({ force: true });
+      await bolinha.waitFor({ state: 'visible', timeout: 5000 });
+      await bolinha.hover().catch(() => {});
+      await bolinha.click({ force: true });
     } catch (e) {
       await fecharMenu(page);
-      throw new Error(`não consegui clicar na bolinha verde (Finalizada): ${e.message}`);
+      throw new Error(`não consegui clicar na bolinha ${cor} ("${alvo}"): ${e.message}`);
     }
 
     await page.waitForTimeout(800);
-    // Pode abrir um modal de observações da situação — confirma/salva se aparecer.
-    await confirmarModalSituacao(page);
+    await confirmarModalSituacao(page); // modal de observações, se aparecer
     await page.waitForLoadState('networkidle').catch(() => {});
     await page.waitForTimeout(2000);
     await fecharMenu(page);
 
     const rel = await acharLinhaDaOp(page, numeroOp, log).catch(() => null);
-    if (rel && rel.situacao === 'finalizada') {
-      log(`[Fase 2] OP ${numeroOp}: situação -> "Finalizada" no Tiny.`);
+    if (rel && rel.situacao === alvo) {
+      log(`${tag} OP ${numeroOp}: situação no Tiny -> "${alvo}".`);
       return true;
     }
     if (rel && rel.idInterno) idInterno = rel.idInterno;
-    log(`[Fase 2] OP ${numeroOp}: cliquei em Finalizada (tentativa ${tentativa}/2), situação ainda "${rel ? rel.situacao : 'sem leitura'}".`);
-    await salvarPrintDebug(page, `op-${numeroOp}-finalizar-t${tentativa}`);
+    log(`${tag} OP ${numeroOp}: cliquei "${alvo}" (tentativa ${tentativa}/2), situação ainda "${rel ? rel.situacao : 'sem leitura'}".`);
+    await salvarPrintDebug(page, `op-${numeroOp}-${alvo}-t${tentativa}`);
   }
   return false;
+}
+
+// Atalho usado pela Fase 2.
+async function finalizarSituacao(page, numeroOp, idInterno, situacaoAtual, log) {
+  return alterarSituacao(page, '[Fase 2]', numeroOp, idInterno, situacaoAtual, 'finalizada', log);
+}
+
+// -------------------------------------------------------------------------
+// Usado pela FASE 1 (sync-tiny-ops.js): ao criar o card de uma OP nova no
+// Dr Chef, marca a OP como "Em Andamento" no Tiny (sai de Pendente/amarelo).
+// Recebe browser page já autenticada. Nunca lança pra fora.
+// -------------------------------------------------------------------------
+async function marcarOpsEmAndamento({ page, log }, opsNovas) {
+  if (String(process.env.TINY_SITUACAO_ANDAMENTO || 'false').toLowerCase() !== 'true') {
+    log('[Situação] marcar "Em Andamento" no Tiny está desligado (TINY_SITUACAO_ANDAMENTO != true).');
+    return;
+  }
+  const lista = (opsNovas || []).filter((o) => o && o.numero);
+  if (!lista.length) return;
+  log(`[Situação] marcando ${lista.length} OP(s) nova(s) como "Em Andamento" no Tiny...`);
+
+  const aceitarDialogo = (d) => d.accept().catch(() => {});
+  page.on('dialog', aceitarDialogo);
+  try {
+    for (const op of lista) {
+      try {
+        const linha = await acharLinhaDaOp(page, String(op.numero), log);
+        if (!linha) {
+          log(`[Situação] OP ${op.numero}: não achei na listagem do Tiny — pulo.`);
+          continue;
+        }
+        await alterarSituacao(
+          page,
+          '[Situação]',
+          String(op.numero),
+          linha.idInterno,
+          linha.situacao,
+          'em_andamento',
+          log
+        );
+      } catch (err) {
+        log(`[Situação] OP ${op.numero}: falhou ao marcar "Em Andamento" (${err.message}) — segue.`);
+      }
+    }
+  } finally {
+    page.off('dialog', aceitarDialogo);
+  }
 }
 
 // Depois de clicar numa situação, o Tiny pode abrir um modal ("Observações da
@@ -734,5 +788,6 @@ async function finalizarOpsCosturaFinalizada({ page, db, log, alertarFalhaCritic
 
 module.exports = {
   finalizarOpsCosturaFinalizada,
+  marcarOpsEmAndamento,
   _internos: { temMarcaSyncTiny, parseQtd, formatQtdBR, situacaoPelaClasse },
 };

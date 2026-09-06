@@ -19,6 +19,10 @@ on:
         description: 'Fase 2: reprocessar mesmo OP já lançada/bloqueada (só teste)'
         type: boolean
         default: false
+      situacao_andamento:
+        description: 'Fase 1: marcar OP nova como "Em Andamento" no Tiny (força ligado nesta rodada)'
+        type: boolean
+        default: false
 
 # Nunca deixa duas execuções rodando ao mesmo tempo — evita lançar o mesmo
 # estoque duas vezes se uma rodada demorar mais que o intervalo do cron.
@@ -69,6 +73,11 @@ jobs:
           # ainda estejam "em aberto" no Tiny. Pode editar esse valor direto
           # aqui quando quiser mudar o corte.
           DATA_CORTE: '2026-08-01'
+          # --- Fase 1: marcar OP como "Em Andamento" no Tiny ao criar o card ---
+          # Sai de "Pendente" (amarelo) -> "Em Andamento" (azul). Hoje só liga
+          # quando você marca a caixa "situacao_andamento" no Run workflow (teste).
+          # Pra ligar PERMANENTE: troque a linha abaixo por  TINY_SITUACAO_ANDAMENTO: 'true'
+          TINY_SITUACAO_ANDAMENTO: ${{ github.event.inputs.situacao_andamento == 'true' && 'true' || 'false' }}
           # --- Fase 2: lançar estoque no Tiny ao entrar em "Costura Finalizada" ---
           # COMEÇA DESLIGADA de propósito (mexe em estoque de verdade). Depois de
           # testar com "Run workflow" em modo simulação, troque para 'true' aqui.
