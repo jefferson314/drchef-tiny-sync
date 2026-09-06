@@ -1,22 +1,35 @@
-# Sincronização automática: Tiny → Dr Chef Produção
-
-Este projeto verifica periodicamente as Ordens de Produção "em aberto" no Tiny
-(Olist ERP) e cria automaticamente um card na coluna **"A Cortar"** do Dr Chef
-Produção para cada OP que ainda não existir por lá. Depois disso, o time
-continua preenchendo tudo normalmente no Dr Chef (cortador, costureira,
-valores, movimentação entre colunas etc.) — a automação só cuida da etapa
-chata de digitar os dados iniciais.
+# Sincronização automática: Tiny ↔ Dr Chef Produção
 
 Roda sozinho, de graça, a cada 20 minutos, usando o GitHub Actions (não
-precisa de servidor nem de deixar seu computador ligado).
+precisa de servidor nem de deixar seu computador ligado). São duas fases:
 
-## Por que não existe uma forma "oficial" (via API) de fazer isso
+**Fase 1 — Tiny → Dr Chef (`sync-tiny-ops.js`):** verifica as Ordens de
+Produção "em aberto" no Tiny (Olist ERP) e cria automaticamente um card na
+coluna **"A Cortar"** do Dr Chef para cada OP que ainda não existir por lá.
+Depois disso, o time preenche tudo normalmente no Dr Chef — a automação só
+cuida da etapa chata de digitar os dados iniciais.
+
+**Fase 2 — Dr Chef → Tiny (`finalizar-tiny-ops.js`):** quando uma OP chega na
+coluna **"Costura Finalizada"** no Dr Chef, o robô abre a OP no Tiny, **lança
+o estoque pela Ordem de Produção** (o Tiny sozinho dá baixa nos insumos pela
+estrutura, dá entrada do produto acabado e sincroniza com os marketplaces) e
+muda a situação da OP para **"Finalizada"**. Se a quantidade que voltou da
+costura for diferente da planejada, o robô primeiro **corrige a quantidade da
+OP no Tiny** e marca a OP com a tag **"estoque divergente"**. As etapas
+seguintes do quadro (Caseado / Acabamento / Produto Acabado / Lançar Estoque)
+seguem 100% manuais no Dr Chef — a Fase 2 não mexe nelas.
+
+> A Fase 2 só age em OPs que vieram do Tiny (criadas pela Fase 1). OP criada
+> manualmente no Dr Chef é ignorada. Cada OP é lançada **uma única vez**
+> (flag `tinyEstoqueLancado` no doc do Firestore).
+
+## Por que tudo isso é "lendo a tela" e não via API
 
 O Tiny/Olist tem uma API oficial, mas ela **não** tem nenhum endpoint para
 Ordens de Produção (conferimos isso direto na tela de cadastro de aplicativo
-da API do Tiny). Por isso a única forma de automatizar é "ler a tela" da
-lista de Ordens de Produção mesmo — é isso que o `sync-tiny-ops.js` faz, com
-um navegador automatizado (Playwright) rodando escondido.
+da API do Tiny). Por isso a única forma de automatizar — nas duas fases — é
+"ler a tela" da lista de Ordens de Produção, com um navegador automatizado
+(Playwright) rodando escondido.
 
 ## O que você precisa
 
@@ -49,7 +62,8 @@ como preferir. Estrutura final esperada:
 ```
 .github/workflows/sync.yml
 package.json
-sync-tiny-ops.js
+sync-tiny-ops.js          <- Fase 1 (Tiny -> Dr Chef)
+finalizar-tiny-ops.js     <- Fase 2 (Dr Chef -> Tiny)
 setup-tiny-session.js
 .gitignore
 README.md
@@ -136,10 +150,39 @@ Para mudar essa data no futuro, é só editar o valor de `DATA_CORTE` direto
 no arquivo `.github/workflows/sync.yml` (formato `AAAA-MM-DD`) e salvar —
 não precisa mexer em Secrets nem reinstalar nada.
 
+## Fase 2: lançar estoque no Tiny (Costura Finalizada)
+
+Configurada por variáveis de ambiente no `.github/workflows/sync.yml`
+(todas opcionais):
+
+| Variável | Padrão | O que faz |
+|---|---|---|
+| `TINY_ESTOQUE_ENABLED` | `true` | `false` desliga a Fase 2 (a Fase 1 continua). |
+| `TINY_ESTOQUE_DRY_RUN` | `false` | `true` = só simula: loga o que faria, não clica em nada nem grava no Firestore. |
+| `TINY_ESTOQUE_SO_OP` | vazio | Números de OP separados por vírgula (ex `3526`). Se preenchido, só processa essas. |
+| `TINY_ESTOQUE_DEPOSITO` | `Geral` | Depósito de entrada das mercadorias. |
+| `TINY_ESTOQUE_MAX_TENTATIVAS` | `5` | Depois de N falhas seguidas numa OP, marca `tinyEstoqueBloqueado` e para de tentar (aparece um alerta no run). |
+
+**Testar com segurança:** na aba **Actions → Run workflow**, marque
+*"Fase 2 em modo simulação"* e/ou preencha *"rodar só nessas OPs"* com um
+número de OP de teste. Em modo simulação nada é alterado no Tiny nem no
+Firestore.
+
+**Se uma OP for bloqueada** (`tinyEstoqueBloqueado: true` no doc): resolva no
+Tiny na mão (lançar estoque + finalizar) e então, no doc do Firestore, ou
+apague o campo `tinyEstoqueBloqueado` (o robô tenta de novo) ou marque
+`tinyEstoqueLancado: true` (o robô considera pronto e não mexe mais).
+
+**Flags que a Fase 2 grava no doc `orders`:** `tinyEstoqueLancado`,
+`tinyEstoqueLancadoAt`, `tinyEstoqueLancadoQtd`, `tinyEstoqueDivergente`,
+`tinyOpFinalizada`, e um item `{type:'tiny-estoque'}` no `history`.
+
 ## Limitações (de propósito)
 
-- Só **cria** cards novos em "A Cortar". Nunca atualiza, move ou apaga um
-  card que já existe — o resto do fluxo continua 100% manual, como sempre.
+- **Fase 1** só **cria** cards novos em "A Cortar". Nunca atualiza, move ou
+  apaga um card que já existe.
+- **Fase 2** nunca **estorna** nada no Tiny. Se algo falha numa OP, ela para
+  nessa OP, alerta e tenta de novo na próxima rodada.
 - O modelo/cor/tamanho são separados automaticamente a partir da descrição
   do produto no Tiny. Na grande maioria dos casos funciona certinho, mas
   alguns produtos foram cadastrados no Tiny com a ordem "cor" e "tamanho"
