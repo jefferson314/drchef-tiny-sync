@@ -77,9 +77,11 @@ const CFG = {
 // Helpers puros (sem browser)
 // ---------------------------------------------------------------------------
 
-// Uma OP é "de origem Tiny" se foi criada pela Fase 1 (history[].by === 'sync-tiny')
-// ou, como rede de segurança, se a observação tem a marca da importação.
-function ehOrigemTiny(dados) {
+// Sinal POSITIVO rápido de que a OP veio do Tiny (criada pela Fase 1). Só serve
+// pra log — a decisão real de "é uma OP do Tiny?" é: existe na listagem do Tiny.
+// (Muitos cards de OPs reais do Tiny foram criados à mão no app antes do sync
+// rodar, então NÃO dá pra exigir essa marca.)
+function temMarcaSyncTiny(dados) {
   if (Array.isArray(dados.history) && dados.history.some((h) => h && h.by === 'sync-tiny')) {
     return true;
   }
@@ -131,37 +133,60 @@ async function salvarPrintDebug(page, apelido) {
   }
 }
 
-// Vai pra listagem, busca a OP pelo número e devolve { idInterno, situacao }
-// ou null se não achar. Sempre recarrega a lista (estado limpo).
+// Vai pra listagem, busca a OP pelo número e devolve { idInterno, situacao }.
+// null => a OP realmente não está na listagem do Tiny (tratar como OP local).
+// Lança erro só se a listagem não carregar de jeito nenhum (problema transitório).
 async function acharLinhaDaOp(page, numeroOp, log) {
-  await page.goto(TINY_LIST_URL, { waitUntil: 'networkidle' });
-  if (page.url().includes('login')) throw new Error('SESSAO_EXPIROU_NO_MEIO');
+  for (let tentativa = 1; tentativa <= 2; tentativa++) {
+    await page.goto(TINY_LIST_URL, { waitUntil: 'networkidle' });
+    if (page.url().includes('login')) throw new Error('SESSAO_EXPIROU_NO_MEIO');
 
-  await page.fill('#pesquisa-mini', String(numeroOp));
-  await page.keyboard.press('Enter');
-  await page.waitForLoadState('networkidle').catch(() => {});
-  await page.waitForTimeout(1200);
-
-  const achou = await page.evaluate((num) => {
-    const linhas = Array.from(document.querySelectorAll('#tabelaListagem tbody tr'));
-    for (const tr of linhas) {
-      const tds = tr.querySelectorAll('td');
-      const cel = tds[2];
-      if (!cel) continue;
-      const valor = (cel.getAttribute('data-value') || cel.textContent || '').trim();
-      if (valor === String(num)) {
-        const led = tds[11] ? tds[11].querySelector('.icon-led') : null;
-        return { idInterno: tr.id || null, ledClass: led ? led.className : '' };
-      }
+    try {
+      await page.waitForSelector('#tabelaListagem tbody tr', { timeout: 15000 });
+    } catch (e) {
+      if (tentativa === 2) throw new Error('a listagem de OPs do Tiny não carregou (nenhuma linha após 2 tentativas)');
+      await page.waitForTimeout(1500);
+      continue;
     }
-    return null;
-  }, numeroOp);
 
-  if (!achou || !achou.idInterno) {
-    log(`[Fase 2] OP ${numeroOp}: não encontrada na listagem do Tiny.`);
-    return null;
+    await page.fill('#pesquisa-mini', String(numeroOp));
+    await page.keyboard.press('Enter');
+    await page.waitForLoadState('networkidle').catch(() => {});
+    await page.waitForTimeout(1600);
+
+    const res = await page.evaluate((num) => {
+      const linhas = Array.from(document.querySelectorAll('#tabelaListagem tbody tr'));
+      let match = null;
+      for (const tr of linhas) {
+        const tds = tr.querySelectorAll('td');
+        const cel = tds[2];
+        if (!cel) continue;
+        const valor = (cel.getAttribute('data-value') || cel.textContent || '').trim();
+        if (valor === String(num)) {
+          const led = tds[11] ? tds[11].querySelector('.icon-led') : null;
+          match = { idInterno: tr.id || null, ledClass: led ? led.className : '' };
+          break;
+        }
+      }
+      return { total: linhas.length, match };
+    }, numeroOp);
+
+    if (res.match && res.match.idInterno) {
+      return { idInterno: res.match.idInterno, situacao: situacaoPelaClasse(res.match.ledClass) };
+    }
+    // Lista carregou, tem linhas, e a OP não está entre elas -> não existe no Tiny.
+    if (res.total > 0) {
+      log(`[Fase 2] OP ${numeroOp}: não está na listagem do Tiny (${res.total} linha(s) no resultado da busca).`);
+      return null;
+    }
+    // 0 linhas depois da busca: pode ser timing — tenta de novo.
+    if (tentativa === 2) {
+      log(`[Fase 2] OP ${numeroOp}: busca no Tiny voltou sem nenhuma linha (2x) — tratando como não encontrada.`);
+      return null;
+    }
+    await page.waitForTimeout(1500);
   }
-  return { idInterno: achou.idInterno, situacao: situacaoPelaClasse(achou.ledClass) };
+  return null;
 }
 
 // Localizador da linha (id numérico -> precisa de seletor de atributo, não "#123").
@@ -369,13 +394,17 @@ async function processarUmaOp({ page, log }, docSnap) {
   const qtdPlanejada = parseQtd(dados.qty);
   const divergente = dados.costura_qtdDivergente === true || qtdConferida !== qtdPlanejada;
 
-  log(`[Fase 2] ${rotulo}: conferida=${qtdConferida}, planejada=${qtdPlanejada}, divergente=${divergente}.`);
+  const marca = temMarcaSyncTiny(dados) ? ' [tem marca sync-tiny]' : '';
+  log(`[Fase 2] ${rotulo}${marca}: conferida=${qtdConferida}, planejada=${qtdPlanejada}, divergente=${divergente}.`);
 
   let linha = await acharLinhaDaOp(page, numeroOp, log);
-  if (!linha) throw new Error('OP não encontrada na listagem do Tiny');
+  if (!linha) {
+    log(`[Fase 2] ${rotulo}: não existe no Tiny — tratada como OP local/manual. Ignorada (nenhuma flag gravada; se aparecer no Tiny depois, será processada).`);
+    return { ignoradaLocal: true };
+  }
 
   if (CFG.dryRun) {
-    log(`[Fase 2] [DRY-RUN] ${rotulo}: FARIA -> ${divergente ? `editar qtd p/ ${qtdConferida} + tag "${CFG.tagDivergente}"; ` : ''}lançar estoque (depósito ${CFG.deposito}); finalizar (situação atual: ${linha.situacao}). Nada alterado.`);
+    log(`[Fase 2] [DRY-RUN] ${rotulo}: FARIA -> ${divergente ? `editar qtd p/ ${qtdConferida} + tag "${CFG.tagDivergente}"; ` : ''}lançar estoque (depósito ${CFG.deposito}); finalizar (situação atual no Tiny: ${linha.situacao}). Nada alterado.`);
     return { dryRun: true };
   }
 
@@ -492,7 +521,7 @@ async function finalizarOpsCosturaFinalizada({ page, db, log, alertarFalhaCritic
       const motivos = [];
       if (d.tinyEstoqueLancado === true) motivos.push('já lançado (tinyEstoqueLancado)');
       if (d.tinyEstoqueBloqueado === true) motivos.push('bloqueado (tinyEstoqueBloqueado)');
-      if (!ehOrigemTiny(d)) motivos.push('não é origem Tiny (sem history.by="sync-tiny" nem obs de importação)');
+      if (!num || num === '(sem número)') motivos.push('sem número de OP');
       if (CFG.soOps.length && !CFG.soOps.includes(num)) motivos.push(`fora do filtro TINY_ESTOQUE_SO_OP (${CFG.soOps.join(',')})`);
       if (motivos.length) {
         log(`[Fase 2]   OP ${num}: pulada — ${motivos.join('; ')}`);
@@ -502,10 +531,13 @@ async function finalizarOpsCosturaFinalizada({ page, db, log, alertarFalhaCritic
     });
 
     if (!candidatas.length) {
-      log('[Fase 2] nenhuma OP de origem Tiny em "Costura Finalizada" pendente de lançamento.');
+      log('[Fase 2] nenhuma OP em "Costura Finalizada" pendente de lançamento.');
       return;
     }
-    log(`[Fase 2] ${candidatas.length} OP(s) a processar: ${candidatas.map((d) => d.data().op).join(', ')}.`);
+    log(
+      `[Fase 2] ${candidatas.length} OP(s) candidata(s): ${candidatas.map((d) => d.data().op).join(', ')}. ` +
+        `Cada uma só é processada se existir na listagem do Tiny (senão = OP local/manual, ignorada).`
+    );
 
     for (const docSnap of candidatas) {
       try {
@@ -531,5 +563,5 @@ async function finalizarOpsCosturaFinalizada({ page, db, log, alertarFalhaCritic
 
 module.exports = {
   finalizarOpsCosturaFinalizada,
-  _internos: { ehOrigemTiny, parseQtd, formatQtdBR, situacaoPelaClasse },
+  _internos: { temMarcaSyncTiny, parseQtd, formatQtdBR, situacaoPelaClasse },
 };
