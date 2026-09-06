@@ -15,6 +15,10 @@ on:
         description: 'Fase 2: rodar só nessas OPs (números separados por vírgula, ex 3526)'
         type: string
         default: ''
+      estoque_force:
+        description: 'Fase 2: reprocessar mesmo OP já lançada/bloqueada (só teste)'
+        type: boolean
+        default: false
 
 # Nunca deixa duas execuções rodando ao mesmo tempo — evita lançar o mesmo
 # estoque duas vezes se uma rodada demorar mais que o intervalo do cron.
@@ -72,6 +76,7 @@ jobs:
           # Modo simulação / OP específica: controlados pelo "Run workflow" manual.
           TINY_ESTOQUE_DRY_RUN: ${{ github.event.inputs.estoque_dry_run || 'false' }}
           TINY_ESTOQUE_SO_OP: ${{ github.event.inputs.estoque_so_op || '' }}
+          TINY_ESTOQUE_FORCE: ${{ github.event.inputs.estoque_force || 'false' }}
           # TINY_ESTOQUE_DEPOSITO: 'Geral'         # depósito de entrada (padrão Geral)
           # TINY_ESTOQUE_MAX_TENTATIVAS: '5'       # bloqueia a OP depois de N falhas
         run: npm run sync

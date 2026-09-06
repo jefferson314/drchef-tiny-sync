@@ -70,6 +70,8 @@ const CFG = {
     .split(',')
     .map((s) => s.trim())
     .filter(Boolean),
+  // Reprocessa OPs mesmo com tinyEstoqueLancado/tinyEstoqueBloqueado (só teste).
+  force: String(process.env.TINY_ESTOQUE_FORCE || 'false').toLowerCase() === 'true',
   tagDivergente: 'estoque divergente',
 };
 
@@ -450,25 +452,24 @@ async function finalizarSituacao(page, numeroOp, idInterno, situacaoAtual, log) 
 
   for (let tentativa = 1; tentativa <= 2; tentativa++) {
     await abrirMenuDaLinha(page, idInterno);
-    const cliqueiVerde = await page.evaluate(() => {
-      const dot = document.querySelector(
-        '#jqContextMenu .dropdown-item-situacoes .icon-led-green'
-      );
-      if (!dot) return false;
-      // dispara um clique "de verdade" (o handler do Tiny é jQuery)
-      const opts = { bubbles: true, cancelable: true, view: window };
-      dot.dispatchEvent(new MouseEvent('mousedown', opts));
-      dot.dispatchEvent(new MouseEvent('mouseup', opts));
-      dot.dispatchEvent(new MouseEvent('click', opts));
-      if (typeof dot.click === 'function') dot.click();
-      return true;
-    });
-    if (!cliqueiVerde) {
+
+    // Clique REAL do Playwright na bolinha verde (data-situacao="2" = Finalizada).
+    // Eventos sintéticos não passam pelo ctxClickHandler do Tiny (não são trusted).
+    const verde = page
+      .locator('#jqContextMenu .icon-led-green.situacaoAlteracao, #jqContextMenu .dropdown-item-situacoes .icon-led-green')
+      .first();
+    try {
+      await verde.waitFor({ state: 'visible', timeout: 5000 });
+      await verde.hover().catch(() => {});
+      await verde.click({ force: true });
+    } catch (e) {
       await fecharMenu(page);
-      throw new Error('bolinha verde (Finalizada) não encontrada no menu "alterar situação"');
+      throw new Error(`não consegui clicar na bolinha verde (Finalizada): ${e.message}`);
     }
-    await page.waitForTimeout(700);
-    await aceitarConfirmacaoSeAparecer(page);
+
+    await page.waitForTimeout(800);
+    // Pode abrir um modal de observações da situação — confirma/salva se aparecer.
+    await confirmarModalSituacao(page);
     await page.waitForLoadState('networkidle').catch(() => {});
     await page.waitForTimeout(2000);
     await fecharMenu(page);
@@ -480,8 +481,33 @@ async function finalizarSituacao(page, numeroOp, idInterno, situacaoAtual, log) 
     }
     if (rel && rel.idInterno) idInterno = rel.idInterno;
     log(`[Fase 2] OP ${numeroOp}: cliquei em Finalizada (tentativa ${tentativa}/2), situação ainda "${rel ? rel.situacao : 'sem leitura'}".`);
+    await salvarPrintDebug(page, `op-${numeroOp}-finalizar-t${tentativa}`);
   }
   return false;
+}
+
+// Depois de clicar numa situação, o Tiny pode abrir um modal ("Observações da
+// situação" / confirmação). Fecha clicando no botão de salvar/confirmar/OK.
+async function confirmarModalSituacao(page) {
+  try {
+    const modal = page
+      .locator('.modal.in:visible, .modal.show:visible, .bootbox.modal:visible, [role="dialog"]:visible')
+      .first();
+    await modal.waitFor({ state: 'visible', timeout: 3000 });
+    const btn = modal
+      .locator('button, a.btn')
+      .filter({ hasText: /^\s*(salvar|confirmar|ok|sim|continuar|alterar)\s*$/i })
+      .first();
+    if (await btn.count()) {
+      await btn.click();
+    } else {
+      // modal sem botão óbvio: tenta o primário
+      await modal.locator('.btn-primary, button[type="submit"]').first().click().catch(() => {});
+    }
+    await page.waitForTimeout(800);
+  } catch (_) {
+    /* nenhum modal apareceu — ok */
+  }
 }
 
 // Aceita modais de confirmação do Tiny (bootbox / sweetalert / modal comum).
@@ -642,12 +668,13 @@ async function finalizarOpsCosturaFinalizada({ page, db, log, alertarFalhaCritic
   // (DRY_RUN — não altera nada), OU você pediu OPs específicas no "Run workflow"
   // (TINY_ESTOQUE_SO_OP — é justamente o modo de testar 1 OP com a feature ainda
   // desligada).
-  if (!CFG.enabled && !CFG.dryRun && !CFG.soOps.length) {
-    log('[Fase 2] desligada (TINY_ESTOQUE_ENABLED=false e sem DRY_RUN / SO_OP).');
+  if (!CFG.enabled && !CFG.dryRun && !CFG.soOps.length && !CFG.force) {
+    log('[Fase 2] desligada (TINY_ESTOQUE_ENABLED=false e sem DRY_RUN / SO_OP / FORCE).');
     return;
   }
   log(
     `[Fase 2] iniciando${CFG.dryRun ? ' (DRY-RUN — nada será alterado)' : ''}` +
+      `${CFG.force ? ' (FORCE — reprocessa OP já lançada/bloqueada)' : ''}` +
       `${CFG.soOps.length ? ` — só as OPs: ${CFG.soOps.join(', ')}` : ''}.`
   );
 
@@ -663,8 +690,8 @@ async function finalizarOpsCosturaFinalizada({ page, db, log, alertarFalhaCritic
       const d = docSnap.data();
       const num = String(d.op || '(sem número)').trim();
       const motivos = [];
-      if (d.tinyEstoqueLancado === true) motivos.push('já lançado (tinyEstoqueLancado)');
-      if (d.tinyEstoqueBloqueado === true) motivos.push('bloqueado (tinyEstoqueBloqueado)');
+      if (!CFG.force && d.tinyEstoqueLancado === true) motivos.push('já lançado (tinyEstoqueLancado)');
+      if (!CFG.force && d.tinyEstoqueBloqueado === true) motivos.push('bloqueado (tinyEstoqueBloqueado)');
       if (!num || num === '(sem número)') motivos.push('sem número de OP');
       if (CFG.soOps.length && !CFG.soOps.includes(num)) motivos.push(`fora do filtro TINY_ESTOQUE_SO_OP (${CFG.soOps.join(',')})`);
       if (motivos.length) {
