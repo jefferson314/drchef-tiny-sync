@@ -208,7 +208,20 @@ async function acharLinhaDaOp(page, numeroOp, log) {
         const valor = (cel.getAttribute('data-value') || cel.textContent || '').trim();
         if (valor === String(num)) {
           const led = tds[11] ? tds[11].querySelector('.icon-led') : null;
-          match = { idInterno: tr.id || null, ledClass: led ? led.className : '' };
+          // td[10] = coluna "Integrações": ganha um selo .estoque_lancado / "E" /
+          // original-title="Estoque lançado" quando o estoque foi lançado.
+          const tdInteg = tds[10];
+          const estoqueLancado = !!(
+            tdInteg &&
+            (tdInteg.querySelector('.estoque_lancado, [original-title*="stoque lan" i]') ||
+              /estoque lan[çc]ado/i.test(tdInteg.getAttribute('original-title') || '') ||
+              tdInteg.textContent.trim().toUpperCase() === 'E')
+          );
+          match = {
+            idInterno: tr.id || null,
+            ledClass: led ? led.className : '',
+            estoqueLancado,
+          };
           break;
         }
       }
@@ -219,7 +232,11 @@ async function acharLinhaDaOp(page, numeroOp, log) {
     }, numeroOp);
 
     if (res.match && res.match.idInterno) {
-      return { idInterno: res.match.idInterno, situacao: situacaoPelaClasse(res.match.ledClass) };
+      return {
+        idInterno: res.match.idInterno,
+        situacao: situacaoPelaClasse(res.match.ledClass),
+        estoqueLancado: res.match.estoqueLancado,
+      };
     }
     if (res.semRes || (respondeu && res.total > 0)) {
       log(`[Fase 2] OP ${numeroOp}: a busca no Tiny respondeu e a OP não apareceu (linhas=${res.total}, semResultado=${res.semRes}).`);
@@ -374,18 +391,18 @@ async function editarQuantidadeEMarcador(page, idInterno, novaQtd, marcador, log
 }
 
 // Menu "..." -> "Lançar estoque" -> painel "Depósitos" -> depósito -> "Lançar".
-// Devolve 'lancado_agora' | 'ja_estava'. Lança erro se não confirmar.
+// Só deve ser chamada quando a linha NÃO tem o selo "estoque lançado" (o
+// chamador checa). Não lê o estado pelo menu (era frágil no headless).
 async function lancarEstoque(page, numeroOp, idInterno, log) {
   await abrirMenuDaLinha(page, idInterno);
+
+  // Segurança extra: se por acaso o menu mostrar "Estornar estoque" (já lançado),
+  // NÃO clica (clicar estornaria). Aborta como "já estava".
   const estado = await lerEstadoDoEstoquePeloMenu(page);
   if (estado === 'lancado') {
     await fecharMenu(page);
-    log(`[Fase 2] OP ${numeroOp}: estoque já constava lançado no Tiny.`);
+    log(`[Fase 2] OP ${numeroOp}: menu mostrou "Estornar estoque" — estoque já lançado, pulando.`);
     return 'ja_estava';
-  }
-  if (estado === 'indeterminado') {
-    await fecharMenu(page);
-    throw new Error('menu da OP não mostrou "Lançar estoque" nem "Estornar estoque"');
   }
 
   await clicarItemMenu(page, '^\\s*Lançar estoque\\s*$');
@@ -424,38 +441,47 @@ async function lancarEstoque(page, numeroOp, idInterno, log) {
 }
 
 // Menu "..." -> "Alterar situação" -> bolinha verde (Finalizada).
-// Devolve true/false (conseguiu confirmar a mudança).
+// Devolve true/false (conseguiu confirmar a mudança pela situação da linha).
 async function finalizarSituacao(page, numeroOp, idInterno, situacaoAtual, log) {
   if (situacaoAtual === 'finalizada') {
     log(`[Fase 2] OP ${numeroOp}: já estava "Finalizada" no Tiny.`);
     return true;
   }
-  await abrirMenuDaLinha(page, idInterno);
-  const cliqueiVerde = await page.evaluate(() => {
-    const dot = document.querySelector(
-      '#jqContextMenu .dropdown-item-situacoes .icon-led-green'
-    );
-    if (!dot || dot.getBoundingClientRect().width === 0) return false;
-    dot.click();
-    return true;
-  });
-  if (!cliqueiVerde) {
-    await fecharMenu(page);
-    throw new Error('bolinha verde (Finalizada) não encontrada no menu "alterar situação"');
-  }
-  await page.waitForTimeout(600);
-  await aceitarConfirmacaoSeAparecer(page);
-  await page.waitForLoadState('networkidle').catch(() => {});
-  await page.waitForTimeout(1800);
 
-  const rel = await acharLinhaDaOp(page, numeroOp, log).catch(() => null);
-  const ok = rel && rel.situacao === 'finalizada';
-  log(
-    ok
-      ? `[Fase 2] OP ${numeroOp}: situação -> "Finalizada" no Tiny.`
-      : `[Fase 2] OP ${numeroOp}: cliquei em Finalizada mas não confirmei a mudança (situação: ${rel ? rel.situacao : 'sem leitura'}).`
-  );
-  return !!ok;
+  for (let tentativa = 1; tentativa <= 2; tentativa++) {
+    await abrirMenuDaLinha(page, idInterno);
+    const cliqueiVerde = await page.evaluate(() => {
+      const dot = document.querySelector(
+        '#jqContextMenu .dropdown-item-situacoes .icon-led-green'
+      );
+      if (!dot) return false;
+      // dispara um clique "de verdade" (o handler do Tiny é jQuery)
+      const opts = { bubbles: true, cancelable: true, view: window };
+      dot.dispatchEvent(new MouseEvent('mousedown', opts));
+      dot.dispatchEvent(new MouseEvent('mouseup', opts));
+      dot.dispatchEvent(new MouseEvent('click', opts));
+      if (typeof dot.click === 'function') dot.click();
+      return true;
+    });
+    if (!cliqueiVerde) {
+      await fecharMenu(page);
+      throw new Error('bolinha verde (Finalizada) não encontrada no menu "alterar situação"');
+    }
+    await page.waitForTimeout(700);
+    await aceitarConfirmacaoSeAparecer(page);
+    await page.waitForLoadState('networkidle').catch(() => {});
+    await page.waitForTimeout(2000);
+    await fecharMenu(page);
+
+    const rel = await acharLinhaDaOp(page, numeroOp, log).catch(() => null);
+    if (rel && rel.situacao === 'finalizada') {
+      log(`[Fase 2] OP ${numeroOp}: situação -> "Finalizada" no Tiny.`);
+      return true;
+    }
+    if (rel && rel.idInterno) idInterno = rel.idInterno;
+    log(`[Fase 2] OP ${numeroOp}: cliquei em Finalizada (tentativa ${tentativa}/2), situação ainda "${rel ? rel.situacao : 'sem leitura'}".`);
+  }
+  return false;
 }
 
 // Aceita modais de confirmação do Tiny (bootbox / sweetalert / modal comum).
@@ -516,20 +542,26 @@ async function processarUmaOp({ page, log }, docSnap) {
     return { dryRun: true };
   }
 
-  // Estado atual do estoque no Tiny.
-  await abrirMenuDaLinha(page, linha.idInterno);
-  const estadoEstoque = await lerEstadoDoEstoquePeloMenu(page);
-  await fecharMenu(page);
+  // Estado do estoque = selo na coluna "Integrações" da linha (confiável no
+  // headless, ao contrário de ler o menu).
+  const jaLancado = linha.estoqueLancado === true;
+  log(`[Fase 2] ${rotulo}: no Tiny -> situação=${linha.situacao}, estoque ${jaLancado ? 'JÁ LANÇADO' : 'não lançado'}.`);
 
   // 1) Divergência -> ajusta quantidade + tag, antes de lançar (só se ainda não lançou).
-  if (estadoEstoque !== 'lancado' && divergente) {
+  if (!jaLancado && divergente) {
     await editarQuantidadeEMarcador(page, linha.idInterno, qtdConferida, CFG.tagDivergente, log);
     linha = await acharLinhaDaOp(page, numeroOp, log);
     if (!linha) throw new Error('OP sumiu da listagem depois de editar a quantidade');
   }
 
   // 2) Lança o estoque (Tiny cuida de baixa de insumo + entrada + marketplace).
-  const resultadoLancamento = await lancarEstoque(page, numeroOp, linha.idInterno, log);
+  let resultadoLancamento;
+  if (jaLancado) {
+    resultadoLancamento = 'ja_estava';
+    log(`[Fase 2] ${rotulo}: estoque já constava lançado — pulando o lançamento.`);
+  } else {
+    resultadoLancamento = await lancarEstoque(page, numeroOp, linha.idInterno, log);
+  }
 
   // 3) Finaliza a situação.
   linha = await acharLinhaDaOp(page, numeroOp, log);
